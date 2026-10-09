@@ -32,6 +32,7 @@ from vllm.config import (
 )
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
+from vllm.platforms.interface import Platform
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.input_processor import InputProcessor
@@ -1579,3 +1580,9 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_sleep_mode_is_available_on_tpu():
+    assert TpuPlatform.is_sleep_mode_available() is True
+    # The vLLM default keys on the platform enum, which is OOT for TPU.
+    assert Platform.is_sleep_mode_available(TpuPlatform()) is False

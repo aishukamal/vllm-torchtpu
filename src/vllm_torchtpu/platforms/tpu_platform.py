@@ -739,6 +739,12 @@ class TpuPlatform(Platform):
         return float(total - free)
 
     @classmethod
+    def is_sleep_mode_available(cls) -> bool:
+        # ModelConfig refuses enable_sleep_mode on platforms that answer False;
+        # TPUWorker.sleep/wake_up implement it by swapping tensor storage.
+        return True
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return False
 
