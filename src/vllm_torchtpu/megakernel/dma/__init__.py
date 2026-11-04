@@ -19,12 +19,19 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from . import pool_alias, stream, vmem
+    from . import arena, pool_alias, stream, vmem
+    from .arena import ArenaSlice, VmemArena
 
-_SUBMODULES = frozenset({"pool_alias", "stream", "vmem"})
-_LAZY: dict[str, str] = {}
+_SUBMODULES = frozenset({"arena", "pool_alias", "stream", "vmem"})
+_LAZY: dict[str, str] = {
+    "ArenaSlice": "arena",
+    "VmemArena": "arena",
+}
 
 __all__ = [
+    "ArenaSlice",
+    "VmemArena",
+    "arena",
     "pool_alias",
     "stream",
     "vmem",
@@ -36,6 +43,11 @@ def __getattr__(name: str) -> Any:
         mod_obj = importlib.import_module(f".{name}", __name__)
         globals()[name] = mod_obj
         return mod_obj
+    if name in _LAZY:
+        mod = importlib.import_module(f".{_LAZY[name]}", __name__)
+        attr = getattr(mod, name)
+        globals()[name] = attr
+        return attr
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
