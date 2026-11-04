@@ -25,12 +25,12 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Concatenate, cast
+from typing import TYPE_CHECKING, Any, Concatenate, Protocol, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -145,6 +145,10 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime.hooks import (
+    apply_layout_request,
+    load_tensor_stream,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -201,8 +205,16 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from torch import nn
+    from vllm.config import ModelConfig
     from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
+    class _GetAllWeightsLoader(Protocol):
+        get_all_weights: Callable[..., Iterable[tuple[str, torch.Tensor]]]
+
+    class _LoadableModel(Protocol):
+        load_weights: Callable[..., object]
 
 
 @dataclass
@@ -660,6 +672,7 @@ class TPUModelRunner(GPUModelRunner):
         profiler_rank: int,
         profiler_world_size: int,
     ):
+        apply_layout_request(vllm_config)
         # Slice-global rank/world used to label phased-profiler traces; the
         # worker resolves them from the TPU rank binding. Required rather than
         # defaulted, because the obvious default -- parallel_config -- is the
@@ -5291,16 +5304,69 @@ class TPUModelRunner(GPUModelRunner):
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
-        with (
-            set_vllm_model_wrapper_context(
-                mesh=self.mesh, vllm_config=self.vllm_config
-            ),
-            set_current_vllm_config(self.vllm_config),
-        ):
-            load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
-            model = load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
+
+        orig_get_all_weights = getattr(model_loader, "get_all_weights", None)
+        orig_load_weights = getattr(model_loader, "load_weights", None)
+        if callable(orig_get_all_weights):
+
+            def _observed_get_all_weights(
+                *args: object, **kwargs: object
+            ) -> Iterator[tuple[str, torch.Tensor]]:
+                """Stream weights through megakernel load_tensor hook."""
+                weights = orig_get_all_weights(*args, **kwargs)
+                return load_tensor_stream(self.vllm_config, weights)
+
+            cast(
+                "_GetAllWeightsLoader", model_loader
+            ).get_all_weights = _observed_get_all_weights
+        elif callable(orig_load_weights):
+
+            def _observed_load_weights(
+                model: nn.Module,
+                model_config: ModelConfig,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                """Hook into model.load_weights to stream observed weights."""
+                orig_mlw = getattr(model, "load_weights", None)
+                if callable(orig_mlw):
+
+                    def _wrapped_load_weights(
+                        weights: Iterable[tuple[str, object]],
+                        *w_args: object,
+                        **w_kwargs: object,
+                    ) -> object:
+                        """Wrap model.load_weights with load_tensor_stream."""
+                        return orig_mlw(
+                            load_tensor_stream(self.vllm_config, weights),
+                            *w_args,
+                            **w_kwargs,
+                        )
+
+                    cast("_LoadableModel", model).load_weights = _wrapped_load_weights
+                return orig_load_weights(model, model_config, *args, **kwargs)
+
+            model_loader.load_weights = _observed_load_weights
+        try:
+            with (
+                set_vllm_model_wrapper_context(
+                    mesh=self.mesh, vllm_config=self.vllm_config
+                ),
+                set_current_vllm_config(self.vllm_config),
+            ):
+                load_fn = cast(
+                    "Callable[..., torch.nn.Module]", model_loader.load_model
+                )
+                model = load_fn(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+        finally:
+            if orig_get_all_weights is not None:
+                cast(
+                    "_GetAllWeightsLoader", model_loader
+                ).get_all_weights = orig_get_all_weights
+            if orig_load_weights is not None:
+                model_loader.load_weights = orig_load_weights
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.is_pooling_model:
@@ -7757,7 +7823,7 @@ class TPUModelRunner(GPUModelRunner):
                 ),
             )
 
-        if not hit:
+        if not hit or out is None:
             # @support_torch_compile annotations will be put on the vLLM model
             # if it supports torch.compile
             kwargs = dict(model_kwargs) if model_kwargs else {}

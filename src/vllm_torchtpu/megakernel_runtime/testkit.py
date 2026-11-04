@@ -217,6 +217,18 @@ def check_spec(
             "'module:attr' string (e.g. '.adapter:create'), so importing the "
             "plugin loads no torch / jax / vLLM"
         )
+    if (
+        lazy_create
+        and spec.load_tensor is not None
+        and (not isinstance(spec.load_tensor, str) or ":" not in spec.load_tensor)
+    ):
+        obs = spec.load_tensor
+        msg = (
+            f"SPEC {spec.name!r}: load_tensor={obs!r} should be a "
+            "lazy 'module:attr' string (e.g. '.adapter:load_tensor'), "
+            "so importing the plugin loads no torch / jax / vLLM"
+        )
+        raise AssertionError(msg)
     codes = list(spec.decline_codes)
     if any(not isinstance(c, str) or not c or c == "other" for c in codes):
         raise AssertionError(f"SPEC {spec.name!r}: bad decline_codes {codes}")
@@ -226,6 +238,8 @@ def check_spec(
         resolve_callable(spec.create, module, what="create")
         if isinstance(spec.layout_request, str):
             resolve_callable(spec.layout_request, module, what="layout_request")
+        if isinstance(spec.load_tensor, str):
+            resolve_callable(spec.load_tensor, module, what="load_tensor")
     return spec
 
 

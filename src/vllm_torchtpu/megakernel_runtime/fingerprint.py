@@ -185,6 +185,14 @@ def plugin_fingerprint(
         "config": dict(config),
         "raw_env": raw_env,
     }
+    ow = getattr(plugin, "load_tensor", None)
+    if ow is not None:
+        doc["load_tensor"] = (
+            f"{getattr(ow, '__module__', '')}:"
+            f"{getattr(ow, '__qualname__', getattr(ow, '__name__', ''))}"
+            if callable(ow)
+            else str(ow)
+        )
     return hashlib.sha256(canonical_json(doc).encode("utf-8")).hexdigest()
 
 

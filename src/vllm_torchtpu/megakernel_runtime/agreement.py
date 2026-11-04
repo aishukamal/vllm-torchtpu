@@ -23,9 +23,20 @@ from typing import Any
 
 import torch
 
+try:
+    from vllm.distributed import get_dcp_group, get_world_group
+except (ImportError, AttributeError):
+    get_dcp_group = None
+    get_world_group = None
+
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.runtime import stats as _stats
-from vllm_torchtpu.megakernel.runtime.contract import DOMAIN_TP, EligibilityResult
+from vllm_torchtpu.megakernel.runtime.contract import (
+    DOMAIN_KERNEL_MESH,
+    DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
+    EligibilityResult,
+)
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 
@@ -77,14 +88,58 @@ def _tp_cpu_group() -> Any:
     return tp_group.cpu_group
 
 
+def _world_cpu_group() -> torch.distributed.ProcessGroup | None:
+    """Return the world CPU group.
+
+    Falls back to dist.group.WORLD when gloo and world_size > 1.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    if int(torch.distributed.get_world_size()) <= 1:
+        return None
+    if get_world_group is not None:
+        try:
+            wg = get_world_group()
+            if wg is not None and getattr(wg, "cpu_group", None) is not None:
+                return wg.cpu_group
+        except (ImportError, AttributeError):
+            pass
+    try:
+        backend = torch.distributed.get_backend()
+        if backend == "gloo":
+            return torch.distributed.group.WORLD
+    except (RuntimeError, ValueError):
+        return None
+    return _tp_cpu_group()
+
+
+def _dcp_or_world_cpu_group(
+    runner: object | None = None,
+) -> torch.distributed.ProcessGroup | None:
+    """Return the DCP CPU group, or fall back to the world CPU group."""
+    del runner
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    if get_dcp_group is not None:
+        try:
+            dg = get_dcp_group()
+            if dg is not None and getattr(dg, "cpu_group", None) is not None:
+                return dg.cpu_group
+        except (ImportError, AttributeError):
+            pass
+    return _world_cpu_group()
+
+
 def agreement_group(domain: str, runner: Any) -> Any:
     """The CPU process group a spec's agreements run over for its
     `collective_domain` (`None` on a single rank): the ranks its kernel
-    communicates with. Only "tp" (the TP group) resolves today;
-    `check_spec` declines the other domains before any collective."""
-    del runner
+    communicates with."""
     if domain == DOMAIN_TP:
         return _tp_cpu_group()
+    if domain == DOMAIN_TP_X_DCP:
+        return _tp_cpu_group() or _dcp_or_world_cpu_group(runner)
+    if domain == DOMAIN_KERNEL_MESH:
+        return _world_cpu_group()
     raise MegakernelPluginError(f"collective_domain {domain!r} has no agreement group")
 
 
