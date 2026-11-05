@@ -553,14 +553,11 @@ def _thinking_budget_step_state_for_runner(
         return None
     markers = tracker.markers
     assert markers is not None
-    pre_async = runner._pre_async_results
-    unsettled = set(pre_async.req_ids) if pre_async is not None else frozenset()
     batch_req_ids = runner.input_batch.req_ids[: runner.input_batch.num_reqs]
     state_table = tracker.prepare_step(
         device,
         batch_req_ids,
         runner.requests,
-        unsettled_req_ids=unsettled,
     )
     if state_table is None:
         return None
@@ -6873,16 +6870,30 @@ class TPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None and not self._mtp_prefill_only
             else 0
         )
+        verify_logits_paddings = self._verify_logits_paddings()
+        token_1d_paddings = sorted(
+            set(self.num_reqs_paddings) | set(verify_logits_paddings)
+        )
         with self._precompile_timed("thinking_budget"):
             self._thinking_budget.precompile(
                 device=self.device,
-                num_reqs_paddings=self.num_reqs_paddings,
-                verify_logits_paddings=self._verify_logits_paddings(),
-                spec_verify_pairs=self._spec_verify_bucket_pairs(),
+                num_reqs_paddings=_rotate_precompile_sweep(
+                    self.num_reqs_paddings, "thinking_budget"
+                ),
+                verify_logits_paddings=_rotate_precompile_sweep(
+                    verify_logits_paddings, "thinking_budget_verify_logits"
+                ),
+                spec_verify_pairs=_rotate_precompile_sweep(
+                    self._spec_verify_bucket_pairs(), "thinking_budget_spec_verify"
+                ),
+                token_1d_paddings=_rotate_precompile_sweep(
+                    token_1d_paddings, "thinking_budget_token_1d"
+                ),
                 max_draft_tokens=max_draft_tokens,
                 vocab_size=self.vocab_size,
                 logits_dtype=self._hidden_states_dtype,
                 sync_fn=synchronize_tensors,
+                dummy_logits_fn=getattr(self, "_dummy_logits", None),
             )
 
     def _precompile_min_tokens_mask(self) -> None:

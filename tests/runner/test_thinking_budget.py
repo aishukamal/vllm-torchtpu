@@ -327,6 +327,66 @@ class TestMarkersAndKMP:
         )
         assert st_closed[1] == 0
 
+    def test_vectorized_sequence_state_matches_scalar_kmp_and_handles_long_prompts(
+        self,
+    ) -> None:
+        import time
+
+        def scalar_ref(
+            seq: list[int], budget: int, markers: ThinkingBudgetMarkers
+        ) -> tuple[int, int, int, int, int, int, int]:
+            st = (min(int(budget), thinking_budget.INT32_MAX), 0, 0, 0, 0, 0, 0)
+            for tok in seq:
+                st = advance_state_py(st, int(tok), markers)
+            return st
+
+        marker_configs = [
+            _reasoning_config(list(QWEN3_START), list(QWEN3_END)),
+            _reasoning_config(list(GEMMA4_START), list(GEMMA4_END)),
+            _reasoning_config([90, 90, 91], [80, 80, 81]),
+            _reasoning_config(
+                start_ids=[90, 91],
+                end_ids=[95, 96, 97],
+                natural_end_ids=[80, 81],
+            ),
+        ]
+        rng = np.random.default_rng(77)
+        for cfg in marker_configs:
+            markers = ThinkingBudgetMarkers.from_reasoning_config(cfg)
+            assert markers is not None
+            vocab = [*markers.start_ids, *markers.natural_end_ids, *markers.end_ids]
+            vocab.extend([1, 2, 3, 4, 5, 50])
+            for length in (0, 1, 31, 32, 33, 64, 256, 1024):
+                for budget in (0, 1, 3, 25):
+                    arr = rng.choice(vocab, size=length)
+                    seq = arr.tolist()
+                    exp = scalar_ref(seq, budget, markers)
+                    assert compute_sequence_state(seq, budget, markers) == exp
+                    assert compute_sequence_state(arr, budget, markers) == exp
+
+        # Long-context 128K-token prompt with embedded <think>...</think> history
+        # and an open final <think> block: verifies accuracy + sub-50ms host cost.
+        qwen_markers = ThinkingBudgetMarkers.from_reasoning_config(
+            _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+        )
+        assert qwen_markers is not None
+        long_prompt = (
+            [42] * 60_000
+            + [QWEN3_START[0]]
+            + [43] * 1_000
+            + [QWEN3_END[0]]
+            + [44] * 66_000
+            + [QWEN3_START[0]]
+            + [45] * 997
+        )
+        t0 = time.perf_counter()
+        long_state = compute_sequence_state(
+            long_prompt, budget=1000, markers=qwen_markers
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        assert long_state == (1000, 1, 997, 0, 0, 0, 0)
+        assert elapsed_ms < 50.0, f"128K prompt seeding took {elapsed_ms:.2f}ms"
+
 
 class TestUpstreamSemanticParity:
     """Differential parity against upstream V1 and V2 thinking-budget semantics."""
@@ -1093,49 +1153,47 @@ class TestTrackerAndRunnerLifecycle:
         assert emitted == [GEMMA4_END[0], GEMMA4_END[1], 42]
         assert req.output_token_ids == emitted
 
-    def test_slot_pool_evicts_unscheduled_slots_and_protects_async(self) -> None:
+    def test_slot_pool_sized_at_max_num_reqs_plus_one_reconciles_and_asserts(
+        self,
+    ) -> None:
         cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
-        # max_num_reqs=2 -> 4 usable slots (1..4). Create 5 budgeted requests!
+        # max_num_reqs=2 -> capacity=3 (slot 0 sentinel + 2 active slots 1..2).
         tracker = ThinkingBudgetTracker(cfg, max_num_reqs=2)
-        reqs: dict[str, CachedRequestState] = {}
-        for i in range(5):
-            rid = f"r{i}"
-            sp = SamplingParams(thinking_token_budget=2)
-            reqs[rid] = _request_state(
-                rid, [1, QWEN3_START[0]], sp, output_token_ids=[10, 11]
+        assert tracker._capacity == 3
+        sp = SamplingParams(thinking_token_budget=2)
+        r0 = _request_state("r0", [1, QWEN3_START[0]], sp, output_token_ids=[10, 11])
+        r1 = _request_state("r1", [1, QWEN3_START[0]], sp, output_token_ids=[10])
+        r2 = _request_state("r2", [1, QWEN3_START[0]], sp, output_token_ids=[])
+        for req in (r0, r1, r2):
+            tracker.add(req.req_id, sp, [1, QWEN3_START[0]])
+
+        table = tracker.prepare_step(
+            torch.device("cpu"), ["r0", "r1"], {"r0": r0, "r1": r1}
+        )
+        assert table is not None
+        assert table.shape == (3, thinking_budget.NUM_STATE_COLS)
+
+        # Exceeding max_num_reqs live slotted requests fails fast with AssertionError.
+        with pytest.raises(AssertionError, match="slot pool exhausted"):
+            tracker.prepare_step(
+                torch.device("cpu"),
+                ["r0", "r1", "r2"],
+                {"r0": r0, "r1": r1, "r2": r2},
             )
-            tracker.add(rid, sp, [1, QWEN3_START[0]])
 
-        tracker.prepare_step(torch.device("cpu"), ["r0", "r1"], reqs)
-        tracker.prepare_step(
-            torch.device("cpu"),
-            ["r2", "r3"],
-            reqs,
-            unsettled_req_ids={"r0", "r1"},
-        )
-        # All 4 slots occupied; r4 arrives while r0 is unsettled async and r2 is
-        # in batch. Eviction must pick r1 or r3 (never r0 or r2).
-        slot_r0_before = tracker._slot_by_req_id["r0"]
-        slot_r2_before = tracker._slot_by_req_id["r2"]
-        tracker.prepare_step(
-            torch.device("cpu"),
-            ["r2", "r4"],
-            reqs,
-            unsettled_req_ids={"r0"},
-        )
-        assert tracker._slot_by_req_id["r0"] == slot_r0_before
-        assert tracker._slot_by_req_id["r2"] == slot_r2_before
-        assert "r4" in tracker._slot_by_req_id
+        # Once r0 leaves active requests (e.g. finished or cleaned up), its slot
+        # is reclaimed automatically when r2 enters the batch.
+        slot_r1_before = tracker._slot_by_req_id["r1"]
+        tracker.prepare_step(torch.device("cpu"), ["r1", "r2"], {"r1": r1, "r2": r2})
+        assert tracker._slot_by_req_id["r1"] == slot_r1_before
+        assert "r0" not in tracker._slot_by_req_id
+        assert "r2" in tracker._slot_by_req_id
 
-        # When the evicted request returns to the batch later, prepare_step
-        # re-derives its state from prompt + output_token_ids ([10, 11] -> budget=2
-        # reached) and forces QWEN3_END immediately.
-        evicted = next(
-            rid for rid in ("r1", "r3") if rid not in tracker._slot_by_req_id
-        )
-        table = tracker.prepare_step(torch.device("cpu"), [evicted], reqs)
+        # If r0 re-enters requests after r2 leaves, prepare_step re-derives r0's
+        # state from prompt + output_token_ids ([10, 11] -> budget=2 reached).
+        table = tracker.prepare_step(torch.device("cpu"), ["r0"], {"r0": r0, "r1": r1})
         assert table is not None and tracker.markers is not None
-        slots = tracker.build_chunk_slot_ids(torch.device("cpu"), [evicted], 0, 1, 2)
+        slots = tracker.build_chunk_slot_ids(torch.device("cpu"), ["r0"], 0, 1, 2)
         assert slots is not None
         out, table = override_and_advance_plain(
             table,
@@ -1145,6 +1203,33 @@ class TestTrackerAndRunnerLifecycle:
         )
         tracker.commit_state_table(table)
         assert out[0, 0].item() == QWEN3_END[0]
+
+    def test_scatter_state_rows_and_chunk_slots_enforce_unique_positive_slots(
+        self,
+    ) -> None:
+        cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        sp = SamplingParams(thinking_token_budget=2)
+        req_a = _request_state("a", [1, QWEN3_START[0]], sp)
+        tracker.add("a", sp, [1, QWEN3_START[0]])
+        table = tracker.prepare_step(torch.device("cpu"), ["a"], {"a": req_a})
+        assert table is not None
+
+        # Duplicate padded sentinel 0 lanes are valid; duplicate positive slots fail.
+        valid = thinking_budget.seed_states(
+            table,
+            torch.tensor([1, 0, 0, 0], dtype=torch.int32),
+            torch.zeros((4, thinking_budget.NUM_STATE_COLS), dtype=torch.int32),
+        )
+        assert valid.shape == table.shape
+        with pytest.raises(AssertionError, match="Duplicate positive slot IDs"):
+            thinking_budget.seed_states(
+                table,
+                torch.tensor([1, 1, 0, 0], dtype=torch.int32),
+                torch.zeros((4, thinking_budget.NUM_STATE_COLS), dtype=torch.int32),
+            )
+        with pytest.raises(AssertionError, match="Duplicate slot"):
+            tracker.build_chunk_slot_ids(torch.device("cpu"), ["a", "a"], 0, 2, 4)
 
 
 class TestSampleTokensIntegration:
@@ -1897,6 +1982,7 @@ class TestSampleTokensIntegration:
         # budget forcing; state_table now records think_count == 2 == budget, so
         # the next step immediately forces QWEN3_END.
         assert out.sampled_token_ids == [[30, 31]]
+        r0.num_computed_tokens += len(out.sampled_token_ids[0])
         slot = runner._thinking_budget._slot_by_req_id["r0"]
         assert (
             int(
@@ -2390,6 +2476,147 @@ class TestStaticShapesAndZeroRecompilations:
         fake_runner._mtp_prefill_only = False
         fake_runner.speculative_config = None
         assert _spec_verify_bucket_pairs_for_runner(fake_runner) == []
+
+    def test_precompile_sweep_rotation_and_zero_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.runner.precompile_sweep_checks import ops_outside_aten
+        from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
+
+        monkeypatch.setattr(tpu_runner_mod, "synchronize_tensors", lambda _out: None)
+        paddings = [8, 16, 32, 64, 128, 256, 512, 1024]
+
+        def run_sweep(parallel_flag: bool, rank: int) -> list[int]:
+            monkeypatch.setenv("LOCAL_RANK", str(rank))
+            if parallel_flag:
+                monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+            else:
+                monkeypatch.delenv("TPU_PARALLEL_PRECOMPILE", raising=False)
+            seen_plain: list[int] = []
+            cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+            runner = SimpleNamespace(
+                _thinking_budget=ThinkingBudgetTracker(cfg, max_num_reqs=paddings[-1]),
+                speculative_config=None,
+                _mtp_prefill_only=False,
+                num_reqs_paddings=paddings,
+                num_tokens_paddings=paddings,
+                max_num_reqs=paddings[-1],
+                vocab_size=16,
+                _hidden_states_dtype=torch.float32,
+                device=torch.device("cpu"),
+                _precompile_timed=lambda _name: MagicMock(
+                    __enter__=lambda *_a: None, __exit__=lambda *_a: False
+                ),
+            )
+            runner._verify_logits_paddings = (
+                TPUModelRunner._verify_logits_paddings.__get__(runner)
+            )
+            runner._spec_verify_bucket_pairs = (
+                TPUModelRunner._spec_verify_bucket_pairs.__get__(runner)
+            )
+            orig_plain = thinking_budget.override_and_advance_plain
+            with patch.object(
+                thinking_budget,
+                "override_and_advance_plain",
+                side_effect=lambda st, sl, sel, m: (
+                    seen_plain.append(int(sl.shape[0])) or orig_plain(st, sl, sel, m)
+                ),
+            ):
+                TPUModelRunner._precompile_thinking_budget(runner)  # type: ignore[arg-type]
+            return seen_plain
+
+        assert run_sweep(False, rank=0) == paddings
+        assert run_sweep(False, rank=5) == paddings
+        for rank in (0, 3, 7, 11):
+            start = (rank % 8) * len(paddings) // 8
+            assert run_sweep(True, rank=rank) == paddings[start:] + paddings[:start]
+
+        # Every compiled thinking_budget kernel must contain zero collectives so
+        # per-rank rotated sweeps cannot deadlock.
+        traced_graphs: list[torch.fx.GraphModule] = []
+
+        def record_backend(
+            gm: torch.fx.GraphModule, _example_inputs: list[torch.Tensor]
+        ):
+            traced_graphs.append(gm)
+            return gm.forward
+
+        with _dynamo_runner_limits():
+            st = torch.zeros((9, thinking_budget.NUM_STATE_COLS), dtype=torch.int32)
+            slots = torch.zeros(4, dtype=torch.int32)
+            for start_ids, end_ids in (
+                (QWEN3_START, QWEN3_END),
+                (GEMMA4_START, GEMMA4_END),
+            ):
+                m = ThinkingBudgetMarkers.from_reasoning_config(
+                    _reasoning_config(list(start_ids), list(end_ids))
+                )
+                assert m is not None
+                torch.compile(
+                    thinking_budget._seed_states_impl,
+                    backend=record_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )(st, slots, torch.zeros((4, 7), dtype=torch.int32))
+                torch.compile(
+                    thinking_budget._override_and_advance_plain_impl,
+                    backend=record_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )(
+                    st,
+                    slots,
+                    torch.zeros((4, 1), dtype=torch.int64),
+                    *m.kernel_args(),
+                )
+                torch.compile(
+                    thinking_budget._prepare_spec_verify_impl,
+                    backend=record_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )(
+                    st,
+                    slots,
+                    torch.zeros(8, dtype=torch.int32),
+                    torch.zeros(4, dtype=torch.int32),
+                    torch.zeros(8, dtype=torch.int64),
+                    torch.zeros(8, dtype=torch.int32),
+                    3,
+                    *m.kernel_args(),
+                )
+                torch.compile(
+                    thinking_budget._advance_spec_states_impl,
+                    backend=record_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )(
+                    st,
+                    slots,
+                    torch.full((4, 4), -1, dtype=torch.int32),
+                    3,
+                    *m.kernel_args(),
+                )
+            torch.compile(
+                thinking_budget._force_logits_rows_impl,
+                backend=record_backend,
+                fullgraph=True,
+                dynamic=False,
+            )(
+                torch.zeros((8, 32), dtype=torch.bfloat16),
+                torch.full((8,), -1, dtype=torch.int32),
+            )
+            torch.compile(
+                thinking_budget._force_token_ids_1d_impl,
+                backend=record_backend,
+                fullgraph=True,
+                dynamic=False,
+            )(
+                torch.zeros(8, dtype=torch.int64),
+                torch.full((8,), -1, dtype=torch.int32),
+            )
+
+        assert traced_graphs
+        assert [op for gm in traced_graphs for op in ops_outside_aten(gm)] == []
 
     @pytest.mark.tpu_test
     def test_tpu_compiled_kernels_match_cpu_reference(self) -> None:
