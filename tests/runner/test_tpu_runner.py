@@ -2943,6 +2943,7 @@ class TestInputStagingFence:
             _dp_num_tokens_across_dp=lambda n: None,
             forward_model=forward_model,
             compute_selected_logits=lambda out, idx: out,
+            _dp_vocab_logits=False,
         )
         for name in (
             "_build_attention_metadata",
@@ -3909,3 +3910,77 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         draft_model["draft_rope"].cos_sin_cache[draft_positions],
         untruncated[draft_positions],
     )
+
+
+class TestLogitsAtDpVocabRows:
+    """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
+    program at the step's DP-wide request bucket, padded and sliced outside
+    it."""
+
+    @staticmethod
+    def _runner(on, step_max_reqs=3, max_num_reqs=32):
+        runner = SimpleNamespace(
+            _dp_vocab_logits=on,
+            _dp_step_max_reqs=step_max_reqs,
+            max_num_reqs=max_num_reqs,
+        )
+        runner._dp_vocab_logits_rows = TPUModelRunner._dp_vocab_logits_rows.__get__(
+            runner
+        )
+        return runner
+
+    def test_off_passes_straight_through(self):
+        runner = self._runner(False)
+        compute = MagicMock(return_value="logits")
+        hidden, indices = torch.zeros(4, 2), torch.arange(3)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, compute, hidden, indices)
+        assert got == "logits"
+        compute.assert_called_once_with(hidden, indices)
+
+    @pytest.mark.parametrize(
+        "step_max_reqs, rows", [(0, 8), (3, 8), (9, 16), (17, 32), (40, 32)]
+    )
+    def test_rows_are_the_bucket_of_the_dp_wide_largest_chunk(
+        self, step_max_reqs, rows
+    ):
+        """Busy and idle ranks read the same all-reduced request count, so
+        they pad to the same bucket; a light step pays only for its bucket."""
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        assert TPUModelRunner._dp_vocab_logits_rows(runner) == rows
+
+    def test_pads_indices_and_slices_the_rows_back(self):
+        runner = self._runner(True, step_max_reqs=3)
+        seen = {}
+
+        def compute(hidden, indices):
+            seen["indices"] = indices
+            return hidden[indices] * 10
+
+        hidden = torch.arange(16.0).reshape(16, 1)
+        indices = torch.tensor([3, 7, 9], dtype=torch.int32)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, compute, hidden, indices)
+        assert seen["indices"].tolist() == [3, 7, 9, 0, 0, 0, 0, 0]
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+
+    def test_pads_hidden_rows_to_another_ranks_larger_chunk(self):
+        """This rank samples 5 rows, but another rank's chunk holds 9
+        requests, so both enter the logits program at 16 rows."""
+        runner = self._runner(True, step_max_reqs=9)
+        seen = {}
+
+        def compute(hidden):
+            seen["shape"] = tuple(hidden.shape)
+            return hidden + 1
+
+        got = TPUModelRunner._logits_at_dp_vocab_rows(
+            runner, compute, torch.zeros(5, 3)
+        )
+        assert seen["shape"] == (16, 3)
+        assert tuple(got.shape) == (5, 3)
+
+    def test_rejects_a_batch_above_the_row_count(self):
+        runner = self._runner(True, step_max_reqs=4)
+        with pytest.raises(ValueError, match="exceeds"):
+            TPUModelRunner._logits_at_dp_vocab_rows(
+                runner, MagicMock(), torch.zeros(9, 2), torch.arange(9)
+            )
