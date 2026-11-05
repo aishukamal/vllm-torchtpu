@@ -21,9 +21,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest import mock
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax.experimental import topologies
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import (
@@ -46,9 +51,23 @@ from vllm_torchtpu.megakernel_runtime.testkit import (
     run_cpu_e2e,
     run_two_ranks,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel import SPEC, adapter, weight_stream
+from vllm_torchtpu.models.kimi_k3.megakernel import (
+    SPEC,
+    adapter,
+    decode,
+    draft_mla,
+    layout,
+    pools,
+    weight_stream,
+)
 from vllm_torchtpu.models.kimi_k3.megakernel.adapter import create
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import Config
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
+    Config,
+    decode_megakernel,
+    dspark_mla,
+    dspark_mla_kernel,
+    paged,
+)
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import (
     BF16,
     PREFIX,
@@ -68,6 +87,8 @@ EXPECTED_BF16_BLOCK_SIZE = 256
 EXPECTED_FP8_BLOCK_SIZE = 512
 EXPECTED_STREAMED_WEIGHTS = 2
 EXPECTED_RANK_COUNT = 2
+EXPECTED_ATTENTION_DP4 = 4
+EXPECTED_POOL_BLOCKS = 4
 MIN_WARMED_BUCKETS = 2
 EXPECTED_CAPTURED_SHARDS = 3
 
@@ -307,8 +328,8 @@ def test_k3_streaming_load_tensor_releases_host_buffers() -> None:
         model=object(),
     )
     dec_tpu = create(RunnerView(tpu_runner, tp_rank=0), {})
-    assert isinstance(dec_tpu, adapter.Decline)
-    assert dec_tpu.code == "runner_lifecycle_unwired"
+    assert isinstance(dec_tpu, adapter.KimiK3MonoProgram)
+    assert dec_tpu.is_tpu is True
     assert adapter.observed_weights_snapshot() == {}
 
     adapter.load_tensor(
@@ -343,8 +364,8 @@ def test_k3_spec_declares_par_dp_and_accepts_attention_dp4() -> None:
         tensor_parallel_size=32, decode_context_parallel_size=8
     )
     dec_dp4 = create(RunnerView(tpu_dp4, tp_rank=0), {"attention_dp": 4})
-    assert isinstance(dec_dp4, adapter.Decline)
-    assert dec_dp4.code == "runner_lifecycle_unwired"
+    assert isinstance(dec_dp4, adapter.KimiK3MonoProgram)
+    assert dec_dp4.attention_dp == EXPECTED_ATTENTION_DP4
 
     dec_bad_dp = create(RunnerView(tpu_dp4, tp_rank=0), {"attention_dp": 8})
     assert isinstance(dec_bad_dp, adapter.Decline)
@@ -473,16 +494,26 @@ def test_k3_mono_program_cpu_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_k3_tpu_device_declines_runner_lifecycle_unwired() -> None:
-    """Verify TPU device declines cleanly with `runner_lifecycle_unwired`."""
+    """Verify TPU device creates KimiK3MonoProgram with model and declines without."""
     tpu_runner = fake_runner(
         hf_config=_kimi_hf_config(),
         tp_size=32,
         device=SimpleNamespace(type="tpu"),
         model=object(),
     )
-    dec = create(RunnerView(tpu_runner, tp_rank=0), {})
+    prog = create(RunnerView(tpu_runner, tp_rank=0), {})
+    assert isinstance(prog, adapter.KimiK3MonoProgram)
+    assert prog.is_tpu is True
+
+    no_model_runner = fake_runner(
+        hf_config=_kimi_hf_config(),
+        tp_size=32,
+        device=SimpleNamespace(type="tpu"),
+        model=None,
+    )
+    dec = create(RunnerView(no_model_runner, tp_rank=0), {})
     assert isinstance(dec, adapter.Decline)
-    assert dec.code == "runner_lifecycle_unwired"
+    assert dec.code == "backbone_not_found"
 
 
 def test_k3_mono_program_two_ranks_kernel_mesh(
@@ -833,7 +864,6 @@ def _write_safetensors_file(
     path: Path, entries: list[tuple[str, tuple[int, ...], str]]
 ) -> tuple[list[tuple[str, tuple[int, ...], str, int, int]], int]:
     """Serialize entry metadata and contiguous payload into a valid safetensors file."""
-    import json
     hdr: dict[str, object] = {}
     cur = 0
     spans: list[tuple[str, tuple[int, ...], str, int, int]] = []
@@ -876,103 +906,122 @@ def _build_synthetic_checkpoint_entries(
     ]
     for l_id in range(SYNTH_NUM_LAYERS):
         p = f"{PREFIX}layers.{l_id}."
-        entries.extend([
-            (f"{p}input_layernorm.weight", (h,), "BF16"),
-            (f"{p}post_attention_layernorm.weight", (h,), "BF16"),
-            (f"{p}self_attention_res_norm.weight", (h,), "BF16"),
-            (f"{p}self_attention_res_proj.weight", (1, h), "F32"),
-            (f"{p}mlp_res_norm.weight", (h,), "BF16"),
-            (f"{p}mlp_res_proj.weight", (1, h), "F32"),
-        ])
+        entries.extend(
+            [
+                (f"{p}input_layernorm.weight", (h,), "BF16"),
+                (f"{p}post_attention_layernorm.weight", (h,), "BF16"),
+                (f"{p}self_attention_res_norm.weight", (h,), "BF16"),
+                (f"{p}self_attention_res_proj.weight", (1, h), "F32"),
+                (f"{p}mlp_res_norm.weight", (h,), "BF16"),
+                (f"{p}mlp_res_proj.weight", (1, h), "F32"),
+            ]
+        )
         if l_id == 0:
-            entries.extend([
-                (f"{p}mlp.gate_proj.weight", (cfg.dense_hidden, h), "BF16"),
-                (f"{p}mlp.up_proj.weight", (cfg.dense_hidden, h), "BF16"),
-                (f"{p}mlp.down_proj.weight", (h, cfg.dense_hidden), "BF16"),
-            ])
+            entries.extend(
+                [
+                    (f"{p}mlp.gate_proj.weight", (cfg.dense_hidden, h), "BF16"),
+                    (f"{p}mlp.up_proj.weight", (cfg.dense_hidden, h), "BF16"),
+                    (f"{p}mlp.down_proj.weight", (h, cfg.dense_hidden), "BF16"),
+                ]
+            )
         else:
             mp = f"{p}block_sparse_moe."
-            entries.extend([
-                (f"{mp}gate.weight", (cfg.experts, h), "BF16"),
-                (f"{mp}gate.e_score_correction_bias", (cfg.experts,), "BF16"),
-                (f"{mp}routed_expert_norm.weight", (lat,), "BF16"),
-                (f"{mp}routed_expert_down_proj.weight", (lat, h), "BF16"),
-                (f"{mp}routed_expert_up_proj.weight", (h, lat), "BF16"),
-                (
-                    f"{mp}shared_experts.gate_proj.weight",
-                    (cfg.shared_hidden, h),
-                    "BF16",
-                ),
-                (
-                    f"{mp}shared_experts.up_proj.weight",
-                    (cfg.shared_hidden, h),
-                    "BF16",
-                ),
-                (
-                    f"{mp}shared_experts.down_proj.weight",
-                    (h, cfg.shared_hidden),
-                    "BF16",
-                ),
-            ])
+            entries.extend(
+                [
+                    (f"{mp}gate.weight", (cfg.experts, h), "BF16"),
+                    (f"{mp}gate.e_score_correction_bias", (cfg.experts,), "BF16"),
+                    (f"{mp}routed_expert_norm.weight", (lat,), "BF16"),
+                    (f"{mp}routed_expert_down_proj.weight", (lat, h), "BF16"),
+                    (f"{mp}routed_expert_up_proj.weight", (h, lat), "BF16"),
+                    (
+                        f"{mp}shared_experts.gate_proj.weight",
+                        (cfg.shared_hidden, h),
+                        "BF16",
+                    ),
+                    (
+                        f"{mp}shared_experts.up_proj.weight",
+                        (cfg.shared_hidden, h),
+                        "BF16",
+                    ),
+                    (
+                        f"{mp}shared_experts.down_proj.weight",
+                        (h, cfg.shared_hidden),
+                        "BF16",
+                    ),
+                ]
+            )
             for eid in range(cfg.experts):
                 ep = f"{mp}experts.{eid}."
-                entries.extend([
-                    (f"{ep}w1.weight_packed", (eh, lat // 2), "U8"),
-                    (f"{ep}w1.weight_scale", (eh, lat // 32), "U8"),
-                    (f"{ep}w3.weight_packed", (eh, lat // 2), "U8"),
-                    (f"{ep}w3.weight_scale", (eh, lat // 32), "U8"),
-                    (f"{ep}w2.weight_packed", (lat, eh // 2), "U8"),
-                    (f"{ep}w2.weight_scale", (lat, eh // 32), "U8"),
-                ])
-        entries.extend([
-            (f"{p}self_attn.q_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
-            (f"{p}self_attn.k_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
-            (f"{p}self_attn.v_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
-            (f"{p}self_attn.g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
-            (f"{p}self_attn.b_proj.weight", (cfg.heads, h), "BF16"),
-            (
-                f"{p}self_attn.q_conv1d.weight",
-                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
-                "BF16",
-            ),
-            (
-                f"{p}self_attn.k_conv1d.weight",
-                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
-                "BF16",
-            ),
-            (
-                f"{p}self_attn.v_conv1d.weight",
-                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
-                "BF16",
-            ),
-            (f"{p}self_attn.A_log", (cfg.heads,), "BF16"),
-            (f"{p}self_attn.dt_bias", (cfg.heads * cfg.head_dim,), "BF16"),
-            (f"{p}self_attn.f_a_proj.weight", (128, h), "BF16"),
-            (f"{p}self_attn.f_b_proj.weight", (cfg.heads * cfg.head_dim, 128), "BF16"),
-            (f"{p}self_attn.o_norm.weight", (cfg.head_dim,), "BF16"),
-            (f"{p}self_attn.o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
-        ])
+                entries.extend(
+                    [
+                        (f"{ep}w1.weight_packed", (eh, lat // 2), "U8"),
+                        (f"{ep}w1.weight_scale", (eh, lat // 32), "U8"),
+                        (f"{ep}w3.weight_packed", (eh, lat // 2), "U8"),
+                        (f"{ep}w3.weight_scale", (eh, lat // 32), "U8"),
+                        (f"{ep}w2.weight_packed", (lat, eh // 2), "U8"),
+                        (f"{ep}w2.weight_scale", (lat, eh // 32), "U8"),
+                    ]
+                )
+        entries.extend(
+            [
+                (f"{p}self_attn.q_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+                (f"{p}self_attn.k_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+                (f"{p}self_attn.v_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+                (f"{p}self_attn.g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+                (f"{p}self_attn.b_proj.weight", (cfg.heads, h), "BF16"),
+                (
+                    f"{p}self_attn.q_conv1d.weight",
+                    (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                    "BF16",
+                ),
+                (
+                    f"{p}self_attn.k_conv1d.weight",
+                    (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                    "BF16",
+                ),
+                (
+                    f"{p}self_attn.v_conv1d.weight",
+                    (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                    "BF16",
+                ),
+                (f"{p}self_attn.A_log", (cfg.heads,), "BF16"),
+                (f"{p}self_attn.dt_bias", (cfg.heads * cfg.head_dim,), "BF16"),
+                (f"{p}self_attn.f_a_proj.weight", (128, h), "BF16"),
+                (
+                    f"{p}self_attn.f_b_proj.weight",
+                    (cfg.heads * cfg.head_dim, 128),
+                    "BF16",
+                ),
+                (f"{p}self_attn.o_norm.weight", (cfg.head_dim,), "BF16"),
+                (f"{p}self_attn.o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
+            ]
+        )
     mla_p = f"{PREFIX}layers.3.self_attn."
-    entries.extend([
-        (f"{mla_p}q_a_proj.weight", (cfg.q_rank, h), "BF16"),
-        (f"{mla_p}kv_a_proj_with_mqa.weight", (cfg.kv_rank + cfg.qk_extra, h), "BF16"),
-        (f"{mla_p}q_b_proj.weight", (cfg.heads * 192, cfg.q_rank), "BF16"),
-        (f"{mla_p}kv_b_proj.weight", (cfg.heads * 256, cfg.kv_rank), "BF16"),
-        (f"{mla_p}g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
-        (f"{mla_p}o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
-        (f"{mla_p}q_a_layernorm.weight", (cfg.q_rank,), "BF16"),
-        (f"{mla_p}kv_a_layernorm.weight", (cfg.kv_rank,), "BF16"),
-        (f"{PREFIX}output_attn_res_norm.weight", (h,), "BF16"),
-        (f"{PREFIX}output_attn_res_proj.weight", (1, h), "F32"),
-        (f"{PREFIX}norm.weight", (h,), "BF16"),
-        ("language_model.lm_head.weight", (cfg.vocab, h), "BF16"),
-    ])
+    entries.extend(
+        [
+            (f"{mla_p}q_a_proj.weight", (cfg.q_rank, h), "BF16"),
+            (
+                f"{mla_p}kv_a_proj_with_mqa.weight",
+                (cfg.kv_rank + cfg.qk_extra, h),
+                "BF16",
+            ),
+            (f"{mla_p}q_b_proj.weight", (cfg.heads * 192, cfg.q_rank), "BF16"),
+            (f"{mla_p}kv_b_proj.weight", (cfg.heads * 256, cfg.kv_rank), "BF16"),
+            (f"{mla_p}g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+            (f"{mla_p}o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
+            (f"{mla_p}q_a_layernorm.weight", (cfg.q_rank,), "BF16"),
+            (f"{mla_p}kv_a_layernorm.weight", (cfg.kv_rank,), "BF16"),
+            (f"{PREFIX}output_attn_res_norm.weight", (h,), "BF16"),
+            (f"{PREFIX}output_attn_res_proj.weight", (1, h), "F32"),
+            (f"{PREFIX}norm.weight", (h,), "BF16"),
+            ("language_model.lm_head.weight", (cfg.vocab, h), "BF16"),
+        ]
+    )
     return entries
 
 
 def _write_synthetic_k3_config(ckpt_dir: Path, cfg: Config) -> None:
     """Write synthetic Kimi K3 text_config to `config.json`."""
-    import json
     hf_json = {
         "text_config": {
             "hidden_size": cfg.dim,
@@ -1224,3 +1273,956 @@ def test_resolve_kernel_position_rank_keys() -> None:
     assert adapter._resolve_kernel_position({}, default_pos=3) == 3
     with pytest.raises(ValueError, match="position must be in 0..31"):
         adapter._resolve_kernel_position({"kernel_rank": 32})
+
+
+AOT_SYNTHETIC_LAYERS = 4
+AOT_SYNTHETIC_KDA_LAYERS = 3
+AOT_DECODE_BATCH = 4
+AOT_SCATTER_BATCH = 8
+AOT_NUM_SLOTS = 8
+AOT_NUM_BLOCKS = 16
+AOT_PAGE_WIDTH = 8
+K3_HIDDEN_DIM = 7168
+KDA_SSM_ROW_COUNT = 77
+KDA_CONV_ROW_COUNT = 4
+U32_WEIGHT_KEYS = frozenset({"expert_gu", "expert_down"})
+U8_WEIGHT_KEYS = frozenset({"expert_gus", "expert_ds"})
+F32_WEIGHT_KEYS = frozenset(
+    {
+        "router_bias",
+        "latent_norm",
+        "k_a_log",
+        "k_dt",
+        "attn_res",
+        "mlp_res",
+        "output_res",
+    }
+)
+
+
+def _synthetic_decode_weight_structs(
+    layers: int = AOT_SYNTHETIC_LAYERS,
+    attention_dp: int = 1,
+) -> dict[str, jax.ShapeDtypeStruct]:
+    """Build per-rank ShapeDtypeStruct decoder weights for deviceless AOT lowering."""
+    shapes = selected_local_shapes(layers=layers)
+    out: dict[str, jax.ShapeDtypeStruct] = {}
+    for name, base_shp in shapes.items():
+        shp = base_shp
+        if attention_dp > 1 and name in decode_megakernel.ATTENTION_DP_WEIGHTS:
+            _kind, axis = decode_megakernel.ATTENTION_DP_WEIGHTS[name]
+            if axis is None:
+                shp = (shp[0], attention_dp, *shp[1:])
+            else:
+                cat_ax = 1 + axis
+                shp = (
+                    *shp[:cat_ax],
+                    shp[cat_ax] * attention_dp,
+                    *shp[cat_ax + 1 :],
+                )
+        if name in U32_WEIGHT_KEYS:
+            dtype = jnp.uint32
+        elif name in U8_WEIGHT_KEYS:
+            dtype = jnp.uint8
+        elif name in F32_WEIGHT_KEYS:
+            dtype = jnp.float32
+        else:
+            dtype = jnp.bfloat16
+        out[name] = jax.ShapeDtypeStruct(shp, dtype)
+    return out
+
+
+def _write_cpu_kda_block(
+    raw_pool: torch.Tensor,
+    block_id: int,
+    conv_active: torch.Tensor,
+    recurrent_state: torch.Tensor,
+) -> None:
+    """Write 77 FP32 recurrent rows and 4 BF16 conv rows into a CPU pool block."""
+    raw_bytes = raw_pool[block_id].view(torch.uint8)
+    ssm_flat = raw_bytes[:KDA_SSM_ROW_COUNT].view(torch.float32).reshape(-1, 128)
+    ssm_flat[: 3 * 128].copy_(recurrent_state.reshape(3 * 128, 128))
+    conv_flat = (
+        raw_bytes[KDA_SSM_ROW_COUNT : KDA_SSM_ROW_COUNT + KDA_CONV_ROW_COUNT]
+        .view(torch.bfloat16)
+        .reshape(-1)
+    )
+    conv_flat[: 3 * 3 * 3 * 128].copy_(conv_active.reshape(-1))
+
+
+def _assert_return_hidden_aot_lowering(mesh_tp: Mesh) -> None:
+    """Assert deviceless TPU v7x return_hidden AOT lowering for local and paged."""
+    weight_structs = _synthetic_decode_weight_structs(AOT_SYNTHETIC_LAYERS)
+    pool_map = tuple(range(pools.MLA_LAYERS))
+    pool_structs = tuple(
+        jax.ShapeDtypeStruct((AOT_NUM_BLOCKS, 128, 2, 640), jnp.bfloat16)
+        for _ in range(pools.MLA_LAYERS)
+    )
+    conv_b4 = jax.ShapeDtypeStruct(
+        (AOT_DECODE_BATCH, AOT_SYNTHETIC_KDA_LAYERS, 3, 3, layout.CONV_HEAD_ROWS, 128),
+        jnp.bfloat16,
+    )
+    rec_b4 = jax.ShapeDtypeStruct(
+        (AOT_DECODE_BATCH, AOT_SYNTHETIC_KDA_LAYERS, 3, 128, 128),
+        jnp.float32,
+    )
+    toks_b4 = jax.ShapeDtypeStruct((AOT_DECODE_BATCH,), jnp.int32)
+
+    def _local_b4_hidden(
+        w: dict[str, jax.Array],
+        c: jax.Array,
+        r: jax.Array,
+        ps: tuple[jax.Array, ...],
+        ids_arr: jax.Array,
+    ) -> tuple[jax.Array, object]:
+        """Lower B=4 non-scattered decode_local with return_hidden=True."""
+        return decode_megakernel.decode_local(
+            w,
+            (c, r, *ps),
+            ids_arr,
+            ids_arr,
+            batch_size=AOT_DECODE_BATCH,
+            layers=AOT_SYNTHETIC_LAYERS,
+            block_tables=jnp.zeros((AOT_DECODE_BATCH, AOT_PAGE_WIDTH), dtype=jnp.int32),
+            dcp_pool_map=pool_map,
+            return_hidden=True,
+        )
+
+    lowered_local = jax.jit(
+        jax.shard_map(
+            _local_b4_hidden,
+            mesh=mesh_tp,
+            in_specs=P(),
+            out_specs=P(),
+            check_vma=False,
+        )
+    ).lower(weight_structs, conv_b4, rec_b4, pool_structs, toks_b4)
+    assert lowered_local.out_info[0].shape == (AOT_DECODE_BATCH, K3_HIDDEN_DIM)
+    assert lowered_local.out_info[0].dtype == jnp.bfloat16
+    assert "tpu_custom_call" in lowered_local.as_text()
+
+    conv_slots = jax.ShapeDtypeStruct(
+        (AOT_NUM_SLOTS, AOT_SYNTHETIC_KDA_LAYERS, 3, 3, layout.CONV_HEAD_ROWS, 128),
+        jnp.bfloat16,
+    )
+    rec_slots = jax.ShapeDtypeStruct(
+        (AOT_NUM_SLOTS, AOT_SYNTHETIC_KDA_LAYERS, 3, 128, 128),
+        jnp.float32,
+    )
+    toks_b8 = jax.ShapeDtypeStruct((AOT_SCATTER_BATCH,), jnp.int32)
+    tables_b8 = jax.ShapeDtypeStruct((AOT_SCATTER_BATCH, AOT_PAGE_WIDTH), jnp.int32)
+
+    def _paged_b8_hidden(
+        w: dict[str, jax.Array],
+        cs: jax.Array,
+        rs: jax.Array,
+        ps: tuple[jax.Array, ...],
+        meta: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array, jax.Array, tuple[jax.Array, ...]]:
+        """Lower B=8 scattered decode_paged with return_hidden=True."""
+        ids_arr, pos_arr, tbl_arr, slt_arr = meta
+        paged_out = paged.decode_paged(
+            w,
+            cs,
+            rs,
+            ps,
+            ids_arr,
+            pos_arr,
+            tbl_arr,
+            slt_arr,
+            batch_size=AOT_SCATTER_BATCH,
+            layers=AOT_SYNTHETIC_LAYERS,
+            dcp_pool_map=pool_map,
+            attention_token_scatter=True,
+            moe_token_scatter_output=True,
+            moe_routed_reduce_scatter=True,
+            sequence_parallel_pre_attention=True,
+            return_hidden=True,
+        )
+        return paged_out[0], paged_out[-3], paged_out[-2], paged_out[-1]
+
+    lowered_paged = jax.jit(
+        jax.shard_map(
+            _paged_b8_hidden,
+            mesh=mesh_tp,
+            in_specs=P(),
+            out_specs=P(),
+            check_vma=False,
+        )
+    ).lower(
+        weight_structs,
+        conv_slots,
+        rec_slots,
+        pool_structs,
+        (toks_b8, toks_b8, tables_b8, toks_b8),
+    )
+    assert lowered_paged.out_info[0].shape == (AOT_SCATTER_BATCH, K3_HIDDEN_DIM)
+    assert lowered_paged.out_info[0].dtype == jnp.bfloat16
+    assert "tpu_custom_call" in lowered_paged.as_text()
+
+
+def _assert_cpu_kda_importer_roundtrip() -> tuple[
+    dict[str, torch.Tensor], torch.Tensor
+]:
+    """Verify CPU KdaImporter 77 FP32 + 4 BF16 row unpack and null-block zeroing."""
+    raw_pools = [
+        torch.zeros((EXPECTED_POOL_BLOCKS, 128, 2, 640), dtype=torch.bfloat16)
+        for _ in range(pools.MLA_LAYERS)
+    ]
+    raw_pools[0][0].fill_(7.0)
+    caches: dict[str, torch.Tensor] = {}
+    for idx in range(layout.NUM_LAYERS):
+        pool_idx = (
+            pools.mla_state_index(idx)
+            if pools.is_mla_layer(idx)
+            else pools.kda_state_index(idx) // 3
+        )
+        caches[f"model.layers.{idx}.self_attn"] = raw_pools[pool_idx]
+
+    expected_rec = torch.arange(
+        pools.KDA_LAYERS * 3 * 128 * 128, dtype=torch.float32
+    ).reshape(pools.KDA_LAYERS, 3, 128, 128) * (1.0 / 65536.0)
+    expected_conv = (
+        torch.arange(pools.KDA_LAYERS * 3 * 3 * 3 * 128, dtype=torch.float32)
+        .remainder(127.0)
+        .to(torch.bfloat16)
+        .reshape(pools.KDA_LAYERS, 3, 3, 3, 128)
+    )
+    kda_blocks = torch.zeros((pools.KDA_LAYERS,), dtype=torch.int32)
+    for k_idx in range(pools.KDA_LAYERS):
+        blk = 0 if k_idx == 0 else (k_idx % 3) + 1
+        kda_blocks[k_idx] = blk
+        if blk != 0:
+            _write_cpu_kda_block(
+                raw_pools[k_idx // 3], blk, expected_conv[k_idx], expected_rec[k_idx]
+            )
+
+    cpu_mesh = Mesh(jax.devices("cpu")[:1], ("tp",))
+    importer = pools.KdaImporter(
+        mesh=cpu_mesh, attention_dp=1, num_slots=EXPECTED_POOL_BLOCKS
+    )
+    assert importer.bind(caches, "bfloat16") == EXPECTED_POOL_BLOCKS
+    unpacked_conv, unpacked_rec = pools.read_kda_states(
+        importer.raw_pools, importer.kda_raw, kda_blocks
+    )
+    assert float(torch.max(torch.abs(unpacked_rec[0])).item()) == 0.0
+    assert float(torch.max(torch.abs(unpacked_conv[0])).item()) == 0.0
+    assert (
+        float(torch.max(torch.abs(unpacked_rec[1:] - expected_rec[1:])).item()) == 0.0
+    )
+    conv_diff = torch.max(
+        torch.abs(unpacked_conv[1:, :, :, :3, :].float() - expected_conv[1:].float())
+    ).item()
+    assert conv_diff == 0.0
+    assert (
+        float(torch.max(torch.abs(unpacked_conv[:, :, :, 3, :].float())).item()) == 0.0
+    )
+
+    conv_bank = torch.zeros(
+        (1, EXPECTED_POOL_BLOCKS, pools.KDA_LAYERS, 3, 3, layout.CONV_HEAD_ROWS, 128),
+        dtype=torch.bfloat16,
+    )
+    rec_bank = torch.zeros(
+        (1, EXPECTED_POOL_BLOCKS, pools.KDA_LAYERS, 3, 128, 128), dtype=torch.float32
+    )
+    conv_bank, rec_bank = importer.import_state(conv_bank, rec_bank, kda_blocks, slot=2)
+    assert (
+        float(torch.max(torch.abs(rec_bank[0, 2, 1:] - expected_rec[1:])).item()) == 0.0
+    )
+    assert float(torch.max(torch.abs(rec_bank[0, 1])).item()) == 0.0
+
+    importer_dp2 = pools.KdaImporter(mesh=cpu_mesh, attention_dp=2, num_slots=9)
+    assert importer_dp2.bind(caches, "bfloat16") == EXPECTED_POOL_BLOCKS
+    conv_dp2 = torch.zeros(
+        (1, 10, pools.KDA_LAYERS, 3, 3, layout.CONV_HEAD_ROWS, 128),
+        dtype=torch.bfloat16,
+    )
+    rec_dp2 = torch.zeros((1, 10, pools.KDA_LAYERS, 3, 128, 128), dtype=torch.float32)
+    conv_dp2, rec_dp2 = importer_dp2.import_state(conv_dp2, rec_dp2, kda_blocks, slot=5)
+    assert float(torch.max(torch.abs(rec_dp2[0, 0])).item()) == 0.0
+    assert float(torch.max(torch.abs(conv_dp2[0, 0].float())).item()) == 0.0
+    return caches, kda_blocks
+
+
+NON_SP_LOGITS_BF16_ATOL = 5e-2
+SYNTHETIC_VOCAB_SHARD = 64
+
+
+def _assert_return_hidden_numeric_parity() -> None:
+    """Verify numeric parity between `return_hidden=True` and `logits` projection."""
+    cpu_dev = jax.devices("cpu")[0]
+    with jax.default_device(cpu_dev):
+        rng = np.random.default_rng(42)
+        prefix_b4 = jnp.asarray(
+            rng.standard_normal((AOT_DECODE_BATCH, K3_HIDDEN_DIM), dtype=np.float32)
+            * 0.125
+        )
+        blocks_b4 = jnp.asarray(
+            rng.standard_normal((AOT_DECODE_BATCH, 2, K3_HIDDEN_DIM), dtype=np.float32)
+            * 0.125
+        )
+        weights = {
+            "output_res": jnp.asarray(
+                rng.standard_normal((1, 2, K3_HIDDEN_DIM), dtype=np.float32) * 0.125
+            ),
+            "final_norm": jnp.ones((K3_HIDDEN_DIM,), dtype=jnp.bfloat16),
+            "lm_head": jnp.asarray(
+                rng.standard_normal(
+                    (K3_HIDDEN_DIM, SYNTHETIC_VOCAB_SHARD), dtype=np.float32
+                )
+                * 0.0625,
+                dtype=jnp.bfloat16,
+            ),
+        }
+        hid_b4 = decode_megakernel.finish_decoder_outputs(
+            prefix_b4,
+            blocks_b4,
+            weights,
+            return_hidden=True,
+            options=(AOT_SYNTHETIC_LAYERS, 1e-5, False, False),
+        )
+        logits_b4 = decode_megakernel.finish_decoder_outputs(
+            prefix_b4,
+            blocks_b4,
+            weights,
+            return_hidden=False,
+            options=(AOT_SYNTHETIC_LAYERS, 1e-5, False, False),
+        )
+        proj_b4 = jnp.dot(
+            hid_b4, weights["lm_head"], preferred_element_type=jnp.float32
+        )
+        assert hid_b4.dtype == jnp.bfloat16
+        assert float(jnp.max(jnp.abs(proj_b4 - logits_b4))) < NON_SP_LOGITS_BF16_ATOL
+
+        prefix_b8 = jnp.asarray(
+            rng.standard_normal((AOT_SCATTER_BATCH, K3_HIDDEN_DIM), dtype=np.float32)
+            * 0.125,
+            dtype=jnp.bfloat16,
+        )
+        blocks_b8 = jnp.zeros((AOT_SCATTER_BATCH, 2, K3_HIDDEN_DIM), dtype=jnp.bfloat16)
+        for batched_bounds in (False, True):
+            hid_b8 = decode_megakernel.finish_decoder_outputs(
+                prefix_b8,
+                blocks_b8,
+                weights,
+                return_hidden=True,
+                options=(AOT_SYNTHETIC_LAYERS, 1e-5, True, batched_bounds),
+            )
+            logits_b8 = decode_megakernel.finish_decoder_outputs(
+                prefix_b8,
+                blocks_b8,
+                weights,
+                return_hidden=False,
+                options=(AOT_SYNTHETIC_LAYERS, 1e-5, True, batched_bounds),
+            )
+            proj_b8 = jnp.dot(
+                hid_b8, weights["lm_head"], preferred_element_type=jnp.float32
+            )
+            max_diff = float(jnp.max(jnp.abs(proj_b8 - logits_b8)))
+            assert hid_b8.dtype == jnp.bfloat16
+            if batched_bounds:
+                assert max_diff == 0.0
+            else:
+                scan_gemv_fp32_atol = K3_HIDDEN_DIM * float(np.finfo(np.float32).eps)
+                assert max_diff < scan_gemv_fp32_atol
+
+
+def test_kimi_k3_mono_program_return_hidden_and_kda_slot() -> None:
+    """Verify TPU v7x return_hidden lowering, KdaImporter CPU unpack, and bind/build."""
+    assert pools.SSM_ROWS == KDA_SSM_ROW_COUNT
+    assert pools.CONV_ROWS == KDA_CONV_ROW_COUNT
+
+    devices = topologies.get_topology_desc(
+        topology_name="tpu7x_2x2x4", platform="tpu"
+    ).devices
+    mesh_tp = Mesh(devices, ("tp",))
+    _assert_return_hidden_aot_lowering(mesh_tp)
+    _assert_return_hidden_numeric_parity()
+    caches, kda_blocks = _assert_cpu_kda_importer_roundtrip()
+
+    tpu_runner = fake_runner(
+        hf_config=_kimi_hf_config(),
+        tp_size=32,
+        block_size=EXPECTED_BF16_BLOCK_SIZE,
+        device=SimpleNamespace(type="tpu"),
+        model=object(),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=32,
+            decode_context_parallel_size=16,
+            cp_kv_cache_interleave_size=EXPECTED_BF16_BLOCK_SIZE,
+        ),
+    )
+    tpu_runner.vllm_config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=32,
+        decode_context_parallel_size=16,
+        cp_kv_cache_interleave_size=EXPECTED_BF16_BLOCK_SIZE,
+    )
+    tpu_runner.vllm_config.compilation_config = SimpleNamespace(
+        static_forward_context=caches
+    )
+    prog_tpu = create(
+        RunnerView(tpu_runner, tp_rank=0),
+        {"attention_dp": 2, "max_slots": 9, "buckets": [4, 8]},
+    )
+    assert isinstance(prog_tpu, adapter.KimiK3MonoProgram)
+    assert prog_tpu.is_tpu is True
+    prog_tpu.load(mesh_tp)
+    bind_info = prog_tpu.bind(RunnerView(tpu_runner, tp_rank=0))
+    assert bind_info["num_blocks"] == EXPECTED_POOL_BLOCKS
+    assert prog_tpu.kda_importer is not None
+
+    slots_g0 = prog_tpu.admit_requests(["dp0-a", "dp0-b"], group=0)
+    slots_g1 = prog_tpu.admit_requests(["dp1-a"], group=1)
+    assert prog_tpu.slot_map.group("dp0-a") == 0
+    assert prog_tpu.slot_map.group("dp1-a") == 1
+    assert set(slots_g0).isdisjoint(set(slots_g1))
+    prog_tpu.import_kda_state("dp0-a", kda_blocks)
+    prog_tpu.admit_requests(["dp0-b"], finished_req_ids=["dp0-a"], group=0)
+    assert "dp0-a" not in prog_tpu.slot_map
+
+    tpu_step = prog_tpu.build(Bucket(1, 8, 16))
+    assert callable(tpu_step)
+
+
+VERIFY_ROWS = 8
+VERIFY_BATCHED_ROWS = 16
+DRAFT_MLA_LAYER_COUNT = 5
+DRAFT_VECTOR_WIDTH = 128
+DRAFT_LATENT_WIDTH = 640
+ACCEPTED_REQ0 = 3
+ACCEPTED_REQ1 = 5
+EXPECTED_REQ1_SOURCE_ROW = 13
+
+
+def _synthetic_mla_draft_weight_structs(
+    cfg: dspark_mla.MlaDraftConfig,
+) -> dict[str, jax.ShapeDtypeStruct]:
+    """Build per-rank ShapeDtypeStruct MLA DSpark draft weights for AOT lowering."""
+    lay = cfg.layers
+    hid = cfg.hidden
+    bf16 = jnp.bfloat16
+    spec_map: dict[str, tuple[tuple[int, ...], jnp.dtype]] = {
+        "ln1": ((lay, 1, hid), bf16),
+        "ln2": ((lay, 1, hid), bf16),
+        "q_norm": ((lay, 1, cfg.q_lora), bf16),
+        "kv_norm": ((lay, 1, DRAFT_LATENT_WIDTH), bf16),
+        "context_norm": ((1, hid), bf16),
+        "final_norm": ((1, hid), bf16),
+        "mask_embed": ((1, hid), bf16),
+        "rot": ((cfg.rope, cfg.rope), bf16),
+        "qkv_tile": ((lay, hid, DRAFT_VECTOR_WIDTH), bf16),
+        "context_tile": ((hid, DRAFT_VECTOR_WIDTH), bf16),
+        "q_b": ((lay, cfg.q_lora, 512), bf16),
+        "w_uk": ((lay, 2, cfg.nope, cfg.kv_lora), bf16),
+        "w_uv": ((lay, 2, cfg.kv_lora, cfg.v_head), bf16),
+        "o": ((lay, 2 * cfg.v_head, hid), bf16),
+        "gate": ((lay, hid, 512), bf16),
+        "up": ((lay, hid, 512), bf16),
+        "down": ((lay, 512, hid), bf16),
+        "fc": ((dspark_mla.FC_IN, dspark_mla.CHUNK), bf16),
+        "w2t": ((cfg.markov_rank, cfg.vocab // dspark_mla.RANKS), bf16),
+        "w1": ((cfg.vocab, cfg.markov_rank), bf16),
+        "rope": ((512, 2 * cfg.rope), jnp.float32),
+        "lm_head": ((hid, cfg.vocab // dspark_mla.RANKS), bf16),
+        "embed": ((cfg.vocab // dspark_mla.RANKS, hid), bf16),
+    }
+    return {
+        name: jax.ShapeDtypeStruct(*spec_map[name])
+        for name in dspark_mla_kernel.WEIGHT_NAMES
+    }
+
+
+def _assert_verify8_and_draft_aot_lowering(mesh_tp: Mesh) -> None:
+    """Assert deviceless TPU v7x AOT lowering for fused_draft_local and verify8."""
+    cfg = dspark_mla.MlaDraftConfig()
+    draft_w = _synthetic_mla_draft_weight_structs(cfg)
+    draft_pools = tuple(
+        jax.ShapeDtypeStruct(
+            (AOT_NUM_BLOCKS, 128, 4, DRAFT_LATENT_WIDTH), jnp.float8_e4m3fn
+        )
+        for _ in range(cfg.layers)
+    )
+    aux_s = jax.ShapeDtypeStruct(
+        (len(cfg.aux_layers), VERIFY_ROWS, cfg.hidden), jnp.bfloat16
+    )
+    logits_s = jax.ShapeDtypeStruct(
+        (1, VERIFY_ROWS, cfg.vocab // dspark_mla.RANKS), jnp.float32
+    )
+    prev_s = jax.ShapeDtypeStruct((1, DRAFT_VECTOR_WIDTH), jnp.int32)
+    pos_s = jax.ShapeDtypeStruct((1,), jnp.int32)
+    tbl_s = jax.ShapeDtypeStruct((1, AOT_PAGE_WIDTH), jnp.int32)
+
+    fused_fn = dspark_mla_kernel.fused_draft_local(
+        cfg, requests=1, pages=AOT_PAGE_WIDTH, rows=VERIFY_ROWS
+    )
+    lowered_draft = jax.jit(
+        jax.shard_map(
+            fused_fn, mesh=mesh_tp, in_specs=P(), out_specs=P(), check_vma=False
+        )
+    ).lower(draft_w, draft_pools, aux_s, logits_s, prev_s, pos_s, pos_s, pos_s, tbl_s)
+    assert lowered_draft.out_info[0].shape == (1, DRAFT_VECTOR_WIDTH)
+    assert lowered_draft.out_info[1].shape == (
+        DRAFT_MLA_LAYER_COUNT,
+        VERIFY_ROWS,
+        DRAFT_LATENT_WIDTH,
+    )
+    assert lowered_draft.out_info[1].dtype == jnp.bfloat16
+    assert "tpu_custom_call" in lowered_draft.as_text()
+
+    dec_w = _synthetic_decode_weight_structs(AOT_SYNTHETIC_LAYERS)
+    pool_map = tuple(range(pools.MLA_LAYERS))
+    pool_s = tuple(
+        jax.ShapeDtypeStruct((AOT_NUM_BLOCKS, 128, 2, DRAFT_LATENT_WIDTH), jnp.bfloat16)
+        for _ in range(pools.MLA_LAYERS)
+    )
+    conv_s = jax.ShapeDtypeStruct(
+        (AOT_NUM_SLOTS, AOT_SYNTHETIC_KDA_LAYERS, 3, 3, layout.CONV_HEAD_ROWS, 128),
+        jnp.bfloat16,
+    )
+    rec_s = jax.ShapeDtypeStruct(
+        (AOT_NUM_SLOTS, AOT_SYNTHETIC_KDA_LAYERS, 3, 128, 128), jnp.float32
+    )
+    toks_v8 = jax.ShapeDtypeStruct((VERIFY_ROWS,), jnp.int32)
+    tbl_v8 = jax.ShapeDtypeStruct((VERIFY_ROWS, AOT_PAGE_WIDTH), jnp.int32)
+
+    def _verify8_and_commit(
+        w: dict[str, jax.Array],
+        cs: jax.Array,
+        rs: jax.Array,
+        ps: tuple[jax.Array, ...],
+        meta: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Lower T=8 verify8 decode_paged + _finish_verify KDA selected commit."""
+        tok_arr, tbl_arr, acc_arr = meta
+        paged_out = paged.decode_paged(
+            w,
+            cs,
+            rs,
+            ps,
+            tok_arr,
+            tok_arr,
+            tbl_arr,
+            tok_arr,
+            batch_size=VERIFY_ROWS,
+            layers=AOT_SYNTHETIC_LAYERS,
+            dcp_pool_map=pool_map,
+            sequence_rows=VERIFY_ROWS,
+            defer_kda_commit=True,
+            attention_token_scatter=True,
+            moe_token_scatter_output=True,
+            moe_routed_reduce_scatter=True,
+            sequence_parallel_pre_attention=True,
+            return_hidden=True,
+        )
+        hid, new_c, new_r = paged_out[0], paged_out[-3], paged_out[-2]
+        srcs, tgts = adapter.select_verify_kda_rows(
+            tok_arr, acc_arr, requests=1, attention_dp=1, bank_slots=AOT_NUM_SLOTS
+        )
+        c_out, r_out = adapter.commit_verify_kda_states(
+            cs,
+            rs,
+            new_c,
+            new_r,
+            (tok_arr, acc_arr),
+        )
+        _ = (srcs, tgts)
+        return hid, c_out, r_out
+
+    lowered_v8 = jax.jit(
+        jax.shard_map(
+            _verify8_and_commit,
+            mesh=mesh_tp,
+            in_specs=P(),
+            out_specs=P(),
+            check_vma=False,
+        )
+    ).lower(dec_w, conv_s, rec_s, pool_s, (toks_v8, tbl_v8, pos_s))
+    assert lowered_v8.out_info[0].shape == (VERIFY_ROWS, K3_HIDDEN_DIM)
+    assert "kda_selected_state_commit" in lowered_v8.as_text()
+
+
+def test_kimi_k3_mono_program_verify8_spec_decode() -> None:
+    """Verify speculative_config verify8 wiring, draft pools, and _finish_verify."""
+    assert decode.KimiDecoder.WIDTH == VERIFY_ROWS
+    assert draft_mla.MlaDsparkDraft.parts(4, dp=2, rows_per=VERIFY_ROWS) == [
+        (0, 1, 2, 3)
+    ]
+    st_cpu = draft_mla.make_draft_state(anchor=11, device=torch.device("cpu"))
+    assert st_cpu.vector.shape == (1, DRAFT_VECTOR_WIDTH)
+    assert st_cpu.vector.device.type == "cpu"
+
+    devices = topologies.get_topology_desc(
+        topology_name="tpu7x_2x2x4", platform="tpu"
+    ).devices
+    mesh_tp = Mesh(devices, ("tp",))
+    _assert_verify8_and_draft_aot_lowering(mesh_tp)
+
+    caches, _ = _assert_cpu_kda_importer_roundtrip()
+    for d_idx in range(DRAFT_MLA_LAYER_COUNT):
+        layer_num = pools.DRAFT_LAYER0 + d_idx
+        caches[f"model.layers.{layer_num}.self_attn"] = torch.zeros(
+            (EXPECTED_POOL_BLOCKS, 128, 2, DRAFT_LATENT_WIDTH), dtype=torch.bfloat16
+        )
+
+    cpu_runner = fake_runner(
+        hf_config=_kimi_hf_config(),
+        tp_size=2,
+        block_size=EXPECTED_BF16_BLOCK_SIZE,
+        token_paddings=(8, 16),
+    )
+    cpu_runner.vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=7
+    )
+    prog = create(
+        RunnerView(cpu_runner, tp_rank=0),
+        {
+            "buckets": [4, 8],
+            "verify_buckets": [8, 16],
+            "max_slots": 8,
+            "caches": caches,
+        },
+    )
+    assert isinstance(prog, adapter.KimiK3MonoProgram)
+    assert prog.speculative_enabled is True
+    assert prog.policy.verify_tokens == (VERIFY_ROWS,)
+
+    bind_info = prog.bind(RunnerView(cpu_runner, tp_rank=0))
+    assert bind_info["draft_pools"] == DRAFT_MLA_LAYER_COUNT
+    assert len(prog.draft_pools) == DRAFT_MLA_LAYER_COUNT
+    assert prog.draft_aux_layers == dspark_mla.MlaDraftConfig().aux_layers
+
+    slots = prog.admit_requests(["v-req-0", "v-req-1"])
+    step_v8 = prog.build(Bucket(VERIFY_ROWS, VERIFY_ROWS, VERIFY_BATCHED_ROWS))
+    out_v8 = step_v8(
+        torch.arange(VERIFY_ROWS, dtype=torch.int32),
+        torch.arange(VERIFY_ROWS, dtype=torch.int32),
+    )
+    assert out_v8.shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+
+    step_vb = prog.build(Bucket(VERIFY_ROWS, VERIFY_BATCHED_ROWS, VERIFY_BATCHED_ROWS))
+    out_vb = step_vb(
+        torch.arange(VERIFY_BATCHED_ROWS, dtype=torch.int32),
+        torch.arange(VERIFY_BATCHED_ROWS, dtype=torch.int32),
+    )
+    assert out_vb.shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+    assert prog.recurrent_slots is not None
+    assert float(torch.max(torch.abs(prog.recurrent_slots)).item()) == 0.0
+
+    deferred_rec = prog.last_verify_recurrent
+    assert deferred_rec is not None
+    accepted = torch.tensor([ACCEPTED_REQ0, ACCEPTED_REQ1], dtype=torch.int32)
+    _, rec_after = prog.finish_verify(accepted)
+    diff0 = torch.max(
+        torch.abs(rec_after[0, slots[0]] - deferred_rec[0, ACCEPTED_REQ0])
+    ).item()
+    diff1 = torch.max(
+        torch.abs(rec_after[0, slots[1]] - deferred_rec[0, EXPECTED_REQ1_SOURCE_ROW])
+    ).item()
+    assert diff0 == 0.0
+    assert diff1 == 0.0
+    assert float(torch.max(torch.abs(rec_after[0, 0])).item()) == 0.0
+    assert prog.last_verify_conv is None
+    assert prog.last_verify_recurrent is None
+
+
+EXPECTED_GLOBAL_POOL_BLOCKS = 128
+EXPECTED_DP2_BANK_SLOTS = 10
+EXPECTED_VERIFY_REQ_COUNT = 2
+EXPECTED_TABLE_WIDTH = 2
+
+
+def _lower_mono_program_tpu_bodies(
+    prog: adapter.KimiK3MonoProgram, mesh_tp: Mesh
+) -> None:
+    """Lower `KimiK3MonoProgram` TPU decode, verify8, and finish bodies on `tp=32`."""
+    local_w = _synthetic_decode_weight_structs(
+        AOT_SYNTHETIC_LAYERS, attention_dp=prog.attention_dp
+    )
+    prog.decoder_weights = {
+        name: torch.empty((1,), dtype=torch.bfloat16) for name in local_w
+    }
+    w_names = sorted(local_w.keys())
+    global_w = [
+        jax.ShapeDtypeStruct((adapter.TP_SIZE, *local_w[n].shape), local_w[n].dtype)
+        for n in w_names
+    ]
+    conv_g = jax.ShapeDtypeStruct(
+        (
+            adapter.TP_SIZE,
+            EXPECTED_DP2_BANK_SLOTS,
+            AOT_SYNTHETIC_KDA_LAYERS,
+            3,
+            3,
+            layout.CONV_HEAD_ROWS,
+            128,
+        ),
+        jnp.bfloat16,
+    )
+    rec_g = jax.ShapeDtypeStruct(
+        (
+            adapter.TP_SIZE,
+            EXPECTED_DP2_BANK_SLOTS,
+            AOT_SYNTHETIC_KDA_LAYERS,
+            3,
+            128,
+            128,
+        ),
+        jnp.float32,
+    )
+    pools_g = [
+        jax.ShapeDtypeStruct(
+            (adapter.TP_SIZE * EXPECTED_POOL_BLOCKS, 128, 2, DRAFT_LATENT_WIDTH),
+            jnp.bfloat16,
+        )
+        for _ in range(len(prog.raw_pools))
+    ]
+
+    dec_body, dec_in, dec_out, dec_don, _ = prog.make_tpu_decode_body(
+        Bucket(1, AOT_SCATTER_BATCH, VERIFY_BATCHED_ROWS),
+        layers=AOT_SYNTHETIC_LAYERS,
+    )
+    toks_b8 = jax.ShapeDtypeStruct((AOT_SCATTER_BATCH,), jnp.int32)
+    tbls_b8 = jax.ShapeDtypeStruct((AOT_SCATTER_BATCH, AOT_PAGE_WIDTH), jnp.int32)
+    lowered_dec = jax.jit(
+        jax.shard_map(
+            dec_body,
+            mesh=mesh_tp,
+            in_specs=dec_in,
+            out_specs=dec_out,
+            check_vma=False,
+        ),
+        donate_argnums=dec_don,
+    ).lower(*global_w, conv_g, rec_g, *pools_g, toks_b8, toks_b8, tbls_b8, toks_b8)
+    assert lowered_dec.out_info[0].shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+    assert lowered_dec.out_info[3].shape == (
+        EXPECTED_GLOBAL_POOL_BLOCKS,
+        128,
+        2,
+        DRAFT_LATENT_WIDTH,
+    )
+
+    ver_body, ver_in, ver_out, ver_don, _ = prog.make_tpu_decode_body(
+        Bucket(VERIFY_ROWS, VERIFY_BATCHED_ROWS, VERIFY_BATCHED_ROWS),
+        layers=AOT_SYNTHETIC_LAYERS,
+    )
+    toks_v16 = jax.ShapeDtypeStruct((VERIFY_BATCHED_ROWS,), jnp.int32)
+    tbls_v16 = jax.ShapeDtypeStruct((VERIFY_BATCHED_ROWS, AOT_PAGE_WIDTH), jnp.int32)
+    lowered_ver = jax.jit(
+        jax.shard_map(
+            ver_body,
+            mesh=mesh_tp,
+            in_specs=ver_in,
+            out_specs=ver_out,
+            check_vma=False,
+        ),
+        donate_argnums=ver_don,
+    ).lower(*global_w, conv_g, rec_g, *pools_g, toks_v16, toks_v16, tbls_v16, toks_v16)
+    assert lowered_ver.out_info[0].shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+    new_conv_g = jax.ShapeDtypeStruct(
+        lowered_ver.out_info[1].shape, lowered_ver.out_info[1].dtype
+    )
+    new_rec_g = jax.ShapeDtypeStruct(
+        lowered_ver.out_info[2].shape, lowered_ver.out_info[2].dtype
+    )
+
+    fin_body, fin_in, fin_out, fin_don, _ = prog.make_tpu_finish_body(
+        requests=EXPECTED_VERIFY_REQ_COUNT,
+        bank_slots=EXPECTED_DP2_BANK_SLOTS,
+    )
+    acc_s = jax.ShapeDtypeStruct((EXPECTED_VERIFY_REQ_COUNT,), jnp.int32)
+    lowered_fin = jax.jit(
+        jax.shard_map(
+            fin_body,
+            mesh=mesh_tp,
+            in_specs=fin_in,
+            out_specs=fin_out,
+            check_vma=False,
+        ),
+        donate_argnums=fin_don,
+    ).lower(conv_g, rec_g, new_conv_g, new_rec_g, toks_v16, acc_s)
+    assert "kda_selected_state_commit" in lowered_fin.as_text()
+
+
+def _make_fake_tpu_bridge(
+    recorded_calls: list[tuple[str, tuple[object, ...]]],
+) -> type[object]:
+    """Create a host-tensor bridge double simulating TPU custom-op donation."""
+
+    class _FakeBridge:
+        """Capture registered TPU custom ops and simulate buffer donation."""
+
+        @staticmethod
+        def register_op(
+            name: str,
+            *_specs: object,
+            **_kwargs: object,
+        ) -> object:
+            """Return a callable simulating custom-op execution on host tensors."""
+
+            def _call(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+                """Record call operands and return fresh post-step buffers."""
+                recorded_calls.append((name, args))
+                if "finish_verify" in name:
+                    c_in, r_in, new_c, new_r, _slt, acc = args
+                    c_next = c_in.clone()
+                    r_next = r_in.clone()
+                    if c_in.device.type == "cpu":
+                        c_next[0, 1] = new_c[0, int(acc[0].item())]
+                        r_next[0, 1] = new_r[0, int(acc[0].item())]
+                    return c_next, r_next
+                c_in, r_in = args[1], args[2]
+                pools_in, toks = args[3:-4], args[-4]
+                rows = int(toks.shape[0])
+                out_r = int(name.rsplit("_r", 1)[1])
+                hid = torch.full((out_r, K3_HIDDEN_DIM), 2.0, dtype=torch.bfloat16)
+                fresh_pools = [p.clone().add_(1.0) for p in pools_in]
+                if "_t8_" in name:
+                    ver_c = (
+                        torch.arange(rows, dtype=torch.float32)
+                        .view(1, rows, 1, 1, 1, 1, 1)
+                        .expand(1, rows, *c_in.shape[2:])
+                        .to(torch.bfloat16)
+                        .clone()
+                    )
+                    ver_r = (
+                        torch.arange(rows, dtype=torch.float32)
+                        .view(1, rows, 1, 1, 1, 1)
+                        .expand(1, rows, *r_in.shape[2:])
+                        .clone()
+                    )
+                    return (hid, ver_c, ver_r, *fresh_pools)
+                return (
+                    hid,
+                    c_in.clone().add_(1.0),
+                    r_in.clone().add_(1.0),
+                    *fresh_pools,
+                )
+
+            return _call
+
+    return _FakeBridge
+
+
+def _assert_tpu_meta_finish_verify(
+    prog: adapter.KimiK3MonoProgram,
+    recorded_calls: list[tuple[str, tuple[object, ...]]],
+) -> None:
+    """Verify non-CPU `finish_verify` dispatches the compiled TPU custom op."""
+    assert prog.conv_slots is not None
+    prog.conv_slots = prog.conv_slots.to(device=torch.device("meta"))
+    assert prog.recurrent_slots is not None
+    prog.recurrent_slots = prog.recurrent_slots.to(device=torch.device("meta"))
+    assert prog.last_verify_conv is not None
+    prog.last_verify_conv = prog.last_verify_conv.to(device=torch.device("meta"))
+    assert prog.last_verify_recurrent is not None
+    prog.last_verify_recurrent = prog.last_verify_recurrent.to(
+        device=torch.device("meta")
+    )
+    prog.clear_tpu_op_cache()
+    prog.finish_verify(torch.tensor([ACCEPTED_REQ0, ACCEPTED_REQ1], dtype=torch.int32))
+    assert recorded_calls[-1][0] == "pallas::k3_mono_finish_verify_r2_dp2_s10"
+    assert prog.last_verify_conv is None
+    assert prog.last_verify_recurrent is None
+
+
+def test_kimi_k3_mono_program_tpu_step_and_verify8_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify TPU decode/verify8 step execution, pool set_ adoption, and DP tables."""
+    caches, _ = _assert_cpu_kda_importer_roundtrip()
+    par_cfg = SimpleNamespace(
+        tensor_parallel_size=32,
+        decode_context_parallel_size=16,
+        cp_kv_cache_interleave_size=EXPECTED_BF16_BLOCK_SIZE,
+    )
+    tpu_runner = fake_runner(
+        hf_config=_kimi_hf_config(),
+        tp_size=32,
+        block_size=EXPECTED_BF16_BLOCK_SIZE,
+        device=SimpleNamespace(type="tpu"),
+        model=object(),
+        speculative_tokens=7,
+        token_paddings=(8, 16),
+        parallel_config=par_cfg,
+    )
+    tpu_runner.vllm_config.parallel_config = par_cfg
+
+    prog_default = create(
+        RunnerView(tpu_runner, tp_rank=0),
+        {"attention_dp": 2, "max_slots": 9, "buckets": [4, 8], "caches": caches},
+    )
+    assert isinstance(prog_default, adapter.KimiK3MonoProgram)
+    assert prog_default.speculative_enabled is False
+    assert prog_default.policy.verify_tokens == ()
+
+    prog = create(
+        RunnerView(tpu_runner, tp_rank=0),
+        {
+            "attention_dp": 2,
+            "max_slots": 9,
+            "buckets": [4, 8],
+            "verify_buckets": [8, 16],
+            "enable_verify_bucket": True,
+            "caches": caches,
+        },
+    )
+    assert isinstance(prog, adapter.KimiK3MonoProgram)
+    assert prog.speculative_enabled is True
+    assert prog.policy.verify_tokens == (VERIFY_ROWS,)
+
+    devices = topologies.get_topology_desc(
+        topology_name="tpu7x_2x2x4", platform="tpu"
+    ).devices
+    mesh_tp = Mesh(devices, ("tp",))
+    prog.load(mesh_tp)
+    prog.bind(RunnerView(tpu_runner, tp_rank=0))
+    _lower_mono_program_tpu_bodies(prog, mesh_tp)
+
+    orig_pool_ids = [id(p) for p in prog.raw_pools]
+    prog.decoder_weights = {"w0": torch.ones((1, 4), dtype=torch.bfloat16)}
+    recorded_calls: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(adapter, "_bridge", _make_fake_tpu_bridge(recorded_calls))
+
+    s_g0 = prog.admit_requests(["req-dp0"], group=0)[0]
+    s_g1 = prog.admit_requests(["req-dp1"], group=1)[0]
+    prog.set_active_batch(
+        [s_g0, s_g1],
+        torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+    )
+
+    dec_step = prog.build(Bucket(1, AOT_SCATTER_BATCH, VERIFY_BATCHED_ROWS))
+    out_dec = dec_step(
+        torch.arange(AOT_SCATTER_BATCH, dtype=torch.int32),
+        torch.arange(AOT_SCATTER_BATCH, dtype=torch.int32),
+    )
+    assert out_dec.shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+    assert [id(p) for p in prog.raw_pools] == orig_pool_ids
+    assert float(prog.raw_pools[0][1, 0, 0, 0].item()) == 1.0
+
+    ver_step = prog.build(Bucket(VERIFY_ROWS, VERIFY_BATCHED_ROWS, VERIFY_BATCHED_ROWS))
+    out_ver = ver_step(
+        torch.arange(VERIFY_BATCHED_ROWS, dtype=torch.int32),
+        torch.arange(VERIFY_BATCHED_ROWS, dtype=torch.int32),
+    )
+    assert out_ver.shape == (VERIFY_BATCHED_ROWS, K3_HIDDEN_DIM)
+    assert [id(p) for p in prog.raw_pools] == orig_pool_ids
+    ver_name, ver_args = recorded_calls[-1]
+    assert ver_name == "pallas::k3_mono_decode_t8_b16_r16"
+    ver_tables = ver_args[-2]
+    assert isinstance(ver_tables, torch.Tensor)
+    assert ver_tables.shape == (VERIFY_BATCHED_ROWS, EXPECTED_TABLE_WIDTH)
+    assert torch.equal(
+        ver_tables[:VERIFY_ROWS],
+        torch.tensor([[11, 12]] * VERIFY_ROWS, dtype=torch.int32),
+    )
+    assert torch.equal(
+        ver_tables[VERIFY_ROWS:],
+        torch.tensor([[21, 22]] * VERIFY_ROWS, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match="uncommitted deferred verify KDA state"):
+        dec_step(
+            torch.arange(AOT_SCATTER_BATCH, dtype=torch.int32),
+            torch.arange(AOT_SCATTER_BATCH, dtype=torch.int32),
+        )
+    _assert_tpu_meta_finish_verify(prog, recorded_calls)
