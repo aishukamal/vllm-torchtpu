@@ -18,6 +18,12 @@ from __future__ import annotations
 import dataclasses
 
 _PAGE_SIZE_ALIGNMENT: int = 4
+PROD_NUM_LAYERS: int = 92
+PROD_HIDDEN_SIZE: int = 8192
+MINI_HIDDEN_SIZE: int = 128
+EXPECTED_TP_SIZE: int = 32
+EXPECTED_DCP_SIZE: int = 8
+NVFP4_GROUP_SIZE: int = 16
 
 
 def _validate_config(cfg: Qwen38Config) -> None:

@@ -24,6 +24,8 @@ import jax.numpy as jnp
 if TYPE_CHECKING:
     from .shapes import Qwen38Config
 
+_LEGACY_PAGE_NDIM: int = 4
+
 
 def rmsnorm(x: jax.Array, weight: jax.Array, eps: float = 1e-6) -> jax.Array:
     """RMSNorm in float32 accumulation, returning bfloat16."""
@@ -111,8 +113,12 @@ def dcp_online_softmax_update(
     dcp_q = cfg.DCP * cfg.Q_R
     sm_scale = 1.0 / math.sqrt(float(cfg.D))
 
-    k_f32 = k_page_fp8[:, 0, :, :].astype(jnp.float32)
-    v_f32 = v_page_fp8[:, 0, :, :].astype(jnp.float32)
+    k_f32 = (
+        k_page_fp8[:, 0, :, :] if k_page_fp8.ndim == _LEGACY_PAGE_NDIM else k_page_fp8
+    ).astype(jnp.float32)
+    v_f32 = (
+        v_page_fp8[:, 0, :, :] if v_page_fp8.ndim == _LEGACY_PAGE_NDIM else v_page_fp8
+    ).astype(jnp.float32)
 
     k_rep = jnp.repeat(k_f32, cfg.DCP * cfg.gqa_ratio, axis=0)
     v_rep = jnp.repeat(v_f32, cfg.DCP * cfg.gqa_ratio, axis=0)

@@ -61,9 +61,16 @@ if TYPE_CHECKING:
         linear_attn: _GdnSublayerLike
         mlp: _MlpSublayerLike
 
-    class _BackboneLike(Protocol):
+    class BackboneLike(Protocol):
         layers: Sequence[_DecoderLayerLike]
         norm: _WeightHolder
+
+    _BackboneLike = BackboneLike
+
+
+def has_observed_weights() -> bool:
+    """Return whether observed weights dictionary is populated."""
+    return bool(_OBSERVED_WEIGHTS)
 
 
 # Master registry of 28 weight and state tensors required by the Qwen3.8-2.4T megakernel
@@ -208,7 +215,7 @@ def _observed_layer_expert_attr(layer_idx: int, attr: str) -> torch.Tensor | Non
     return None
 
 
-def find_qwen38_2_4t_backbone(model: object) -> _BackboneLike:
+def find_qwen38_2_4t_backbone(model: object) -> BackboneLike:
     """Locate the Qwen3.8-2.4T decoder backbone (`layers` + `norm`) inside a model."""
     for path in (
         ("model", "language_model", "model"),
@@ -223,7 +230,7 @@ def find_qwen38_2_4t_backbone(model: object) -> _BackboneLike:
             if cur is None:
                 break
         if cur is not None and hasattr(cur, "layers") and hasattr(cur, "norm"):
-            return cast("_BackboneLike", cur)
+            return cast("BackboneLike", cur)
     msg = f"Cannot locate Qwen3.8-2.4T backbone in {type(model).__name__}"
     raise ValueError(msg)
 
@@ -630,14 +637,12 @@ def extract_backbone_weights_torch(
     if rank_backbones is not None:
         rank_dicts = [
             _extract_single_rank_np(
-                b, cfg, use_observed=(r_idx == 0 and bool(_OBSERVED_WEIGHTS))
+                b, cfg, use_observed=(r_idx == 0 and has_observed_weights())
             )
             for r_idx, b in enumerate(rank_backbones)
         ]
         return _to_rank_torch_tensors(rank_dicts, device=device)
 
     backbone = find_qwen38_2_4t_backbone(model)
-    single = _extract_single_rank_np(
-        backbone, cfg, use_observed=bool(_OBSERVED_WEIGHTS)
-    )
+    single = _extract_single_rank_np(backbone, cfg, use_observed=has_observed_weights())
     return _to_rank_torch_tensors([single], device=device)
