@@ -8,10 +8,14 @@ behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
     ``moe_tp_decode_nvfp4`` (W4A8 grouped FP4 decode kernel + in-kernel
     all-reduce), and slices ``[:n]``.
   - At ``n in (16, 32, 64)``, runs ``moe_tp_decode_nvfp4`` directly.
-  - At ``n > 64`` (mixed / prefill buckets), runs ``moe_tp_decode._tp_chain``
-    (``fused_moe_func`` -> ``gmm_v2`` W4A16 + online-FP8 shared expert) plus
-    ``lax.psum`` on the same K-major FP4 weights and 4D block scales, with zero
-    weight duplication.
+  - At ``n > 64`` (mixed / prefill buckets), runs
+    ``fused_moe_prefill_nvfp4_stage_a`` (W4A16 default, Stage-A whole-expert
+    ring + fused online-FP8 shared expert + chunked RS/AG combine) when
+    ``FUSED_MOE_PREFILL_NVFP4_KERNEL`` is enabled, the layer admits it, and
+    ``n >= FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS`` (default ``2048``);
+    otherwise runs ``moe_tp_decode._tp_chain`` (``fused_moe_func`` ->
+    ``gmm_v2`` W4A16 + online-FP8 shared expert) plus ``lax.psum`` on the same
+    K-major FP4 weights and 4D block scales, with zero weight duplication.
 
 Supports both EP x TP MoE (e.g. ``EP2xTP4`` via ``ENABLE_EXPERT_PARALLEL=true``
 and ``TPU_MOE_EP_TP_SIZE=4``, where ``ep_size * tp_size == n_ranks`` with
@@ -31,6 +35,9 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental import (
+    fused_moe_prefill_nvfp4 as prefill_nvfp4,
+)
 from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
 from vllm_torchtpu.layers.adapter import (
     moe_routing,
@@ -44,6 +51,7 @@ logger = init_logger(__name__)
 
 _ENV_FLAG = "USE_MOE_TP_DECODE_NVFP4_KERNEL"
 _OP_ATTR = "_moe_tp_decode_nvfp4_op"
+_PREFILL_PROBE_ROWS = 128
 _BUFFERS = (
     "_moe_tp_decode_nvfp4_sw13",
     "_moe_tp_decode_nvfp4_ss13",
@@ -67,6 +75,7 @@ class _OpStatics:
     onehot_threshold: int
     use_ep: bool = False
     router_bias: bool = False
+    prefill_above: int | None = None
     fast: bool = False
     hbm_operands: bool = False
     split_meta: bool = True
@@ -213,6 +222,25 @@ def _admit(runner: Any, n_ranks: int) -> _Admitted | str:
             f"{layer.w13_weight.dtype}, s13 {list(w13_scale.shape)}, "
             f"s2 {list(w2_scale.shape)}, shared w13 {list(shared[0].shape)})"
         )
+    sw13_t, ss13_t, sw2_t, ss2_t = shared
+    prefill_above: int | None = None
+    if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL and (
+        prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+            jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
+            _sds(layer.w13_weight),
+            _sds(layer.w2_weight),
+            _sds(w13_scale),
+            _sds(w2_scale),
+            _sds(sw13_t),
+            _sds(ss13_t),
+            _sds(sw2_t),
+            _sds(ss2_t),
+            jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.bfloat16),
+            jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.int32),
+        )
+    ):
+        min_tokens = envs.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
+        prefill_above = max(kernel.ROW_BUCKETS[-1], min_tokens - 1)
     statics = _OpStatics(
         topk=topk,
         routed_scale=float(runner.routed_scaling_factor),
@@ -221,6 +249,7 @@ def _admit(runner: Any, n_ranks: int) -> _Admitted | str:
         onehot_threshold=resolve_onehot_permute_threshold(),
         use_ep=bool(par.use_ep),
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
+        prefill_above=prefill_above,
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
         split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
     )
@@ -230,6 +259,49 @@ def _admit(runner: Any, n_ranks: int) -> _Admitted | str:
         hidden=hidden,
         statics=statics,
         experts_start=int(experts_start),
+    )
+
+
+def _prefill_chain(
+    x,
+    scores,
+    bias,
+    is_pad,
+    w13,
+    w2,
+    s13,
+    s2,
+    sw13,
+    ss13,
+    sw2,
+    ss2,
+    st: _OpStatics,
+    axis: str,
+    e0,
+):
+    """Reduced layer output via ``fused_moe_prefill_nvfp4_stage_a`` (W4A16)."""
+    logger.info(
+        "moe_tp_decode_nvfp4: fused MoE prefill kernel traced for %d tokens",
+        x.shape[0],
+    )
+    w, ids = fp8_decode._route(x, scores, bias, is_pad, st)
+    return prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        None,
+        w,
+        ids.astype(jnp.int32),
+        axis_name=axis,
+        expert_start=e0.astype(jnp.int32) if st.use_ep else None,
+        routed_scale=st.routed_scale,
+        w2_n_chunk=st.w2_n_chunk,
     )
 
 
@@ -310,6 +382,10 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 split_meta=statics.split_meta,
                 w2_n_chunk=statics.w2_n_chunk,
             )
+        if statics.prefill_above is not None and n > statics.prefill_above:
+            return _prefill_chain(
+                x, scores, bias, is_pad, *weights, statics, axis, e0.reshape(())
+            ).astype(x.dtype)
         partial = fp8_decode._tp_chain(
             x, scores, bias, is_pad, *weights, statics, e0.reshape(())
         )
