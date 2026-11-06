@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch import nn
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -43,6 +44,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.lora.request import LoRARequest
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -55,6 +57,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import sleep_mode
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -153,6 +156,8 @@ class TPUWorker(WorkerBase):
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype
             ]
+
+        self._sleep_state: sleep_mode.SleepState | None = None
 
         # TPU profiler: every worker captures the chips it owns into its own
         # sandbox, and the captures are merged into one run directory on stop
@@ -895,6 +900,10 @@ class TPUWorker(WorkerBase):
     def get_model(self):
         return self.model_runner.get_model()
 
+    def get_draft_model(self) -> nn.Module | None:
+        # Eagle3, DFlash and DSpark proposers load a draft model; n-gram has none.
+        return getattr(self.model_runner.drafter, "draft_model", None)
+
     def get_supported_tasks(self):
         return self.model_runner.get_supported_tasks()
 
@@ -929,6 +938,118 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleep_state is not None
+
+    def sleep(self, level: int = 1) -> None:
+        """Free device memory with the semantics of vLLM's GPU worker sleep.
+
+        The GPU worker hands this to a ``SleepModeBackend`` (``cumem`` by
+        default) that offloads or drops allocator pools; TPU has no such
+        allocator, so this is a per-tensor storage swap and no backend is
+        involved. Level 1 copies the model weights to host and frees their
+        device storage. Level 2 frees parameters without a copy, keeps host
+        copies of the model's and the draft model's buffers (as on GPU, since
+        no weight load rewrites them), and leaves parameters matching
+        ``sleep_preserve_parameter_names`` resident on device. Both levels
+        free the KV cache. Every tensor object survives with zero-element
+        storage until ``wake_up``. ``enable_nccl_comm_suspend`` has no effect:
+        there is no NCCL communicator to suspend. This is a pure memory
+        operation: no runtime checkpoint, no weight-transfer state. Calling
+        it while already asleep is a no-op.
+        """
+        if self._sleep_state is not None:
+            logger.warning(
+                "TPU worker is already sleeping at level %d.", self._sleep_state.level
+            )
+            return
+        assert level in (1, 2), f"sleep level must be 1 or 2, got {level}"
+        if self.model_config.enable_nccl_comm_suspend:
+            logger.warning_once(
+                "enable_nccl_comm_suspend has no effect on TPU: there is no NCCL "
+                "communicator to suspend."
+            )
+        free_bytes_before_sleep, _ = sleep_mode.device_memory_info(self.devices)
+
+        kv_cache = sleep_mode.record_kv_cache(self._kv_cache_tensors())
+        weights, preserved = sleep_mode.record_weights(
+            self.model_runner.get_model(),
+            level,
+            draft_model=self.get_draft_model(),
+            preserve_patterns=self.model_config.sleep_preserve_parameter_names,
+        )
+        if has_kv_transfer_group():
+            get_kv_transfer_group().unregister_kv_caches()
+        sleep_mode.release_weights(weights)
+        sleep_mode.release_kv_cache(kv_cache)
+        self._sleep_state = sleep_mode.SleepState(
+            level=level,
+            sleeping_tags=set(sleep_mode.SLEEP_TAGS),
+            weights=weights,
+            kv_cache=kv_cache,
+            preserved=preserved,
+        )
+
+        free_bytes_after_sleep, total = sleep_mode.device_memory_info(self.devices)
+        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        used_bytes = total - free_bytes_after_sleep
+        assert freed_bytes >= 0, "Memory usage increased after sleeping."
+        logger.info(
+            "Sleep mode freed %s GiB memory, %s GiB memory is still in use.",
+            format_gib(freed_bytes),
+            format_gib(used_bytes),
+        )
+        logger.info(
+            "Sleep level %d released %s GiB of weight storage and %s GiB of KV "
+            "cache storage; %d preserved parameters stay resident.",
+            level,
+            format_gib(sum(record.nbytes for record in weights)),
+            format_gib(sum(record.nbytes for record in kv_cache)),
+            len(preserved),
+        )
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Re-allocate what ``sleep`` freed; ``weights`` before ``kv_cache``.
+
+        ``weights``: fresh device storage of the recorded shapes, with the host
+        copies written back (all tensors after level 1, buffers only after
+        level 2); the rest stays uninitialized until the caller loads weights,
+        and preserved parameters were never touched. ``kv_cache``: zero-filled
+        tensors of the recorded geometry, with the per-layer views rebuilt
+        onto their root allocation, then the KV connector's registrations
+        restored. ``None`` wakes every sleeping tag. A tag that is already
+        awake, or a call while not sleeping, is a no-op.
+        """
+        state = self._sleep_state
+        if state is None:
+            logger.warning("TPU worker is not sleeping.")
+            return
+        requested = set(sleep_mode.SLEEP_TAGS) if tags is None else set(tags)
+        unknown = requested - set(sleep_mode.SLEEP_TAGS)
+        if unknown:
+            raise ValueError(
+                f"unknown wake_up tags {sorted(unknown)}; expected a subset of "
+                f"{list(sleep_mode.SLEEP_TAGS)}"
+            )
+        if "weights" in requested and "weights" in state.sleeping_tags:
+            sleep_mode.restore_weights(state.weights)
+            state.sleeping_tags.discard("weights")
+        if "kv_cache" in requested and "kv_cache" in state.sleeping_tags:
+            sleep_mode.restore_kv_cache(state.kv_cache)
+            if has_kv_transfer_group():
+                get_kv_transfer_group().restore_kv_caches()
+            state.sleeping_tags.discard("kv_cache")
+        if not state.sleeping_tags:
+            self._sleep_state = None
+
+    def _kv_cache_tensors(self) -> list[torch.Tensor]:
+        runner = self.model_runner
+        tensors = [*runner.kv_caches, *runner.kv_cache_raw_tensors]
+        if runner._kv_cache_bundle is not None:
+            tensors.append(runner._kv_cache_bundle)
+        return tensors
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()
