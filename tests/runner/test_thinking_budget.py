@@ -37,6 +37,8 @@ from vllm_torchtpu.runner.thinking_budget import (
     NO_FORCED_TOKEN,
     UNTRACKED_STATE,
     ThinkingBudgetMarkers,
+    ThinkingBudgetSpecChunk,
+    ThinkingBudgetStepState,
     ThinkingBudgetTracker,
     _force_logits_rows_impl,
     _force_token_ids_1d_impl,
@@ -51,11 +53,7 @@ from vllm_torchtpu.runner.thinking_budget import (
     query_forced_token_py,
     seed_states,
 )
-from vllm_torchtpu.runner.tpu_runner import (
-    TPUModelRunner,
-    _ThinkingBudgetSpecChunk,
-    _ThinkingBudgetStepState,
-)
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -895,6 +893,101 @@ class TestVectorizedKernels:
         assert exp_st2[1] == 0
         assert tuple(state_table[0].tolist()) == UNTRACKED_STATE
 
+    def test_large_batch_512_scatter_and_spec_verify_with_padded_segments(self) -> None:
+        cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
+        markers = ThinkingBudgetMarkers.from_reasoning_config(cfg)
+        assert markers is not None
+
+        max_num_reqs = 512
+        real_num_reqs = 300
+        max_draft_tokens = 5
+        padded_tokens = 3072
+        rng = np.random.default_rng(512)
+
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=max_num_reqs)
+        requests: dict[str, CachedRequestState] = {}
+        batch_ids: list[str] = []
+        scalar_states: dict[int, thinking_budget.StateTuple] = {}
+        for i in range(real_num_reqs):
+            rid = f"r_{i}"
+            batch_ids.append(rid)
+            budget = None if i % 3 == 0 else int(i % 5)
+            sp = SamplingParams(thinking_token_budget=budget)
+            prompt = [1, *GEMMA4_START] if i % 2 == 0 else [1, 2]
+            requests[rid] = _request_state(rid, prompt, sp)
+            tracker.add(rid, sp, prompt)
+            if budget is not None:
+                scalar_states[i] = compute_sequence_state(prompt, budget, markers)
+
+        state_table = tracker.prepare_step(torch.device("cpu"), batch_ids, requests)
+        assert state_table is not None
+        assert tuple(state_table[0].tolist()) == UNTRACKED_STATE
+        slot_ids = tracker.build_chunk_slot_ids(
+            torch.device("cpu"), batch_ids, 0, real_num_reqs, max_num_reqs
+        )
+        assert slot_ids is not None
+        assert int(slot_ids[real_num_reqs].item()) == 0
+
+        draft_lens = rng.integers(0, max_draft_tokens + 1, size=real_num_reqs)
+        total_drafts = int(draft_lens.sum())
+        assert total_drafts < padded_tokens
+        draft_np = np.zeros(padded_tokens, dtype=np.int32)
+        seg_np = np.full(padded_tokens, real_num_reqs, dtype=np.int64)
+        grp_np = np.zeros(padded_tokens, dtype=np.int32)
+        vocab_pool = np.array([*GEMMA4_START, *GEMMA4_END, 20, 21, 22, 23], np.int32)
+
+        expected_forced = np.full(padded_tokens, NO_FORCED_TOKEN, dtype=np.int32)
+        expected_eff = np.zeros(padded_tokens, dtype=np.int32)
+        cursor = 0
+        for req_i in range(real_num_reqs):
+            n_d = int(draft_lens[req_i])
+            st = scalar_states.get(req_i)
+            for g_i in range(n_d):
+                tok = int(rng.choice(vocab_pool))
+                draft_np[cursor] = tok
+                seg_np[cursor] = req_i
+                grp_np[cursor] = g_i
+                if st is None:
+                    expected_eff[cursor] = tok
+                else:
+                    f_tok = query_forced_token_py(st, markers)
+                    expected_forced[cursor] = f_tok
+                    expected_eff[cursor] = (
+                        NO_FORCED_TOKEN if f_tok >= 0 and tok != f_tok else tok
+                    )
+                    st = advance_state_py(st, tok, markers)
+                cursor += 1
+        # Fill padded tail with non-zero tokens at segment_ids == real_num_reqs.
+        draft_np[cursor:] = 77
+        expected_eff[cursor:] = 77
+
+        forced_target, eff_drafts = _prepare_spec_verify_drafts(
+            state_table,
+            slot_ids,
+            torch.from_numpy(draft_np),
+            torch.from_numpy(seg_np),
+            torch.from_numpy(grp_np),
+            max_draft_tokens,
+            *markers.kernel_args(),
+        )
+        assert forced_target.tolist() == expected_forced.tolist()
+        assert eff_drafts.tolist() == expected_eff.tolist()
+
+        # Duplicate active (segment_id, group_index) fails fast on CPU.
+        active_req = next(iter(scalar_states))
+        bad_seg = torch.tensor([active_req, active_req], dtype=torch.int64)
+        bad_grp = torch.tensor([0, 0], dtype=torch.int32)
+        with pytest.raises(AssertionError, match="Duplicate active"):
+            _prepare_spec_verify_drafts(
+                state_table,
+                slot_ids,
+                torch.tensor([20, 21], dtype=torch.int32),
+                bad_seg,
+                bad_grp,
+                max_draft_tokens,
+                *markers.kernel_args(),
+            )
+
 
 class TestTrackerAndRunnerLifecycle:
     """Lifecycle hooks, batch reordering, preemption, chunked prefill, and slots."""
@@ -1332,6 +1425,24 @@ class TestTrackerAndRunnerLifecycle:
         assert not tracker._chunk_fast_cache
         assert tracker.prepare_step(dev, ["r0", "r1"], reqs) is None
 
+    def test_missing_marker_token_ids_logs_warning_once(self) -> None:
+        cfg_no_ids = _reasoning_config([], [])
+        tracker = ThinkingBudgetTracker(cfg_no_ids, max_num_reqs=4)
+        assert not tracker.enabled
+        with patch.object(thinking_budget.logger, "warning_once") as mock_warn:
+            tracker.add("plain", SamplingParams(temperature=0.0), [1, 2])
+            neg = SamplingParams()
+            neg.thinking_token_budget = -1
+            tracker.add("neg", neg, [1, 2])
+            mock_warn.assert_not_called()
+
+            tracker.add("b0", SamplingParams(thinking_token_budget=4), [1, 2])
+            tracker.add("b1", SamplingParams(thinking_token_budget=8), [1, 2])
+            assert mock_warn.call_count == 2
+            # Identical static message across requests so warning_once deduplicates.
+            assert mock_warn.call_args_list[0] == mock_warn.call_args_list[1]
+        assert not tracker
+
 
 class TestSampleTokensIntegration:
     """End-to-end ``TPUModelRunner.sample_tokens`` coverage across runner modes."""
@@ -1577,12 +1688,12 @@ class TestSampleTokensIntegration:
             r_fresh = _request_state("r0", [1, *GEMMA4_START], params)
             table = tb.prepare_step(torch.device("cpu"), ["r0"], {"r0": r_fresh})
             assert table is not None and tb.markers is not None
-            step_state = _ThinkingBudgetStepState(tb, table, tb.markers, frozenset())
+            step_state = ThinkingBudgetStepState(tb, table, tb.markers, frozenset())
             tb_chunk = step_state.spec_chunk(
                 torch.device("cpu"), ["r0"], 0, 1, md.draft_lengths.shape[0]
             )
             assert tb_chunk is not None and isinstance(
-                tb_chunk, _ThinkingBudgetSpecChunk
+                tb_chunk, ThinkingBudgetSpecChunk
             )
             with torch.compiler.set_stance("force_eager"):
                 res = TPUModelRunner._sample_spec_verify_chunk(
@@ -1791,6 +1902,59 @@ class TestSampleTokensIntegration:
         runner._modify_prev_results()
         assert req.output_token_ids == [40, 41, 42, *GEMMA4_END, 70, 71, 72]
 
+    def test_async_zero_placeholder_settled_before_cold_reseed_in_sample_tokens(
+        self,
+    ) -> None:
+        # Use token 0 as the reasoning start marker so an unsettled async `[0]`
+        # placeholder in `req.output_token_ids` would falsely enter thinking if
+        # `_compute_request_state` ran before `_modify_prev_results`!
+        cfg = _reasoning_config([0], [99])
+        params = SamplingParams(temperature=0.0, thinking_token_budget=0)
+        prompt = [5, 6]
+        req = _request_state("r0", prompt, params, output_token_ids=[0])
+        runner = self._make_plain_runner(
+            cfg, ["r0"], {"r0": req}, vocab_size=128, async_scheduling=True
+        )
+        # Simulate a cold-reseed state (no allocated slot, no _dirty_states)
+        # while `_pre_async_results` still holds an unsettled `[0]` placeholder
+        # whose real committed token on device is `42` (NOT marker `0`).
+        runner._thinking_budget._dirty_states.clear()
+        runner._thinking_budget._slot_by_req_id.clear()
+        assert runner._thinking_budget.needs_output_reseed(["r0"], torch.device("cpu"))
+
+        runner.input_batch.num_tokens_no_spec[0] = 3
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=["r0"],
+            request_seq_lens=[(0, req, 2, "r0")],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={},
+            wait_for_copy=lambda: torch.tensor([[42]], dtype=torch.int64),
+        )
+
+        logits = torch.zeros((4, 128), dtype=torch.float32)
+        logits[0, 55] = 8.0
+        runner.execute_model_state = SimpleNamespace(
+            scheduler_output=SimpleNamespace(
+                num_scheduled_tokens={"r0": 1},
+                finished_req_ids=set(),
+                has_structured_output_requests=False,
+            ),
+            draft_chunks=[],
+            logits_list=[logits],
+            num_reqs_list=[1],
+            spec_decode_metadata_list=[None],
+            mamba_state_indices_list=None,
+            pooler_output_list=[],
+            top_tokens=False,
+            kv_save_nan_check=None,
+        )
+        out = _run_sample_tokens(runner).get_output()
+        # Placeholder `[0]` was settled to `42` BEFORE cold reseed, so thinking
+        # remained closed and token `55` was NOT overridden to end marker `99`!
+        assert out.sampled_token_ids == [[55]]
+        runner._modify_prev_results()
+        assert req.output_token_ids == [42, 55]
+
     @pytest.mark.parametrize("mode", ["greedy", "random", "synthetic"])
     def test_spec_verify_chunk_modes_smart_drafter_bonus_and_early_reject(
         self, mode: str
@@ -1854,7 +2018,7 @@ class TestSampleTokensIntegration:
 
         table = tracker.prepare_step(torch.device("cpu"), ["r0", "r1", "r2"], reqs)
         assert table is not None
-        step_state = _ThinkingBudgetStepState(tracker, table, markers, frozenset())
+        step_state = ThinkingBudgetStepState(tracker, table, markers, frozenset())
         tb_chunk = step_state.spec_chunk(
             torch.device("cpu"), ["r0", "r1", "r2"], 0, 3, 4
         )
@@ -2240,7 +2404,7 @@ class TestStaticShapesAndZeroRecompilations:
                 )
                 tb.commit_state_table(st_table)
 
-            step_state = _ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
+            step_state = ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
             for num_tokens in runner._verify_logits_paddings():
                 for num_reqs in runner.num_reqs_paddings:
                     if not runner._spec_verify_bucket_reachable(num_tokens, num_reqs):
@@ -2351,8 +2515,7 @@ class TestStaticShapesAndZeroRecompilations:
                 num_reqs_paddings=num_reqs_paddings,
                 verify_logits_paddings=verify_logits_paddings,
                 max_draft_tokens=3,
-                vocab_size=64,
-                logits_dtype=torch.float32,
+                dummy_logits_fn=lambda n: torch.zeros((n, 64), dtype=torch.float32),
                 sync_fn=lambda _x: None,
                 precompile_top_tokens=use_top_tokens,
             )
@@ -2573,6 +2736,7 @@ class TestStaticShapesAndZeroRecompilations:
                     __enter__=lambda *_a: None, __exit__=lambda *_a: False
                 ),
             )
+            runner._dummy_logits = TPUModelRunner._dummy_logits.__get__(runner)
             runner._verify_logits_paddings = (
                 TPUModelRunner._verify_logits_paddings.__get__(runner)
             )
@@ -2687,6 +2851,7 @@ class TestStaticShapesAndZeroRecompilations:
                     __enter__=lambda *_a: None, __exit__=lambda *_a: False
                 ),
             )
+            runner._dummy_logits = TPUModelRunner._dummy_logits.__get__(runner)
             runner._verify_logits_paddings = (
                 TPUModelRunner._verify_logits_paddings.__get__(runner)
             )
@@ -2973,8 +3138,9 @@ class TestStaticShapesAndZeroRecompilations:
                 num_reqs_paddings=num_reqs_paddings,
                 verify_logits_paddings=verify_logits_paddings,
                 max_draft_tokens=3,
-                vocab_size=128,
-                logits_dtype=torch.bfloat16,
+                dummy_logits_fn=lambda n: torch.zeros(
+                    (n, 128), dtype=torch.bfloat16
+                ).to(tpu),
                 sync_fn=synchronize_tensors,
                 precompile_top_tokens=True,
             )

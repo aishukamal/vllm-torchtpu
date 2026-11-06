@@ -25,8 +25,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator, Sequence
-from collections.abc import Set as AbstractSet
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -525,151 +524,6 @@ SAMPLING_EPS = 1e-5
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
-
-
-@dataclass
-class _ThinkingBudgetStepState:
-    tracker: thinking_budget.ThinkingBudgetTracker
-    state_table: torch.Tensor
-    markers: thinking_budget.ThinkingBudgetMarkers
-    discard_req_ids: AbstractSet[str]
-
-    def commit(self, state_table: torch.Tensor) -> None:
-        self.state_table = state_table
-        self.tracker.commit_state_table(state_table)
-
-    def spec_chunk(
-        self,
-        device: torch.device,
-        req_ids: Sequence[str | None],
-        start_idx: int,
-        end_idx: int,
-        min_slot_len: int,
-    ) -> "_ThinkingBudgetSpecChunk | None":
-        slot_ids = self.tracker.build_chunk_slot_ids(
-            device,
-            req_ids,
-            start_idx,
-            end_idx,
-            max(self.tracker.max_num_reqs, min_slot_len),
-            self.discard_req_ids,
-        )
-        if slot_ids is None:
-            return None
-        return _ThinkingBudgetSpecChunk(step=self, slot_ids=slot_ids)
-
-
-@dataclass(frozen=True)
-class _ThinkingBudgetSpecChunk:
-    step: _ThinkingBudgetStepState
-    slot_ids: torch.Tensor
-
-    def prepare_logits(
-        self,
-        draft_token_ids: torch.Tensor,
-        target_logits: torch.Tensor,
-        md: SpecDecodeMetadata,
-        max_draft_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return thinking_budget.prepare_spec_verify_logits(
-            self.step.state_table,
-            self.slot_ids,
-            draft_token_ids,
-            target_logits,
-            md.segment_ids,
-            md.group_indices,
-            max_draft_tokens,
-            self.step.markers,
-        )
-
-    def prepare_tokens(
-        self,
-        draft_token_ids: torch.Tensor,
-        target_argmax: torch.Tensor,
-        md: SpecDecodeMetadata,
-        max_draft_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return thinking_budget.prepare_spec_verify_tokens(
-            self.step.state_table,
-            self.slot_ids,
-            draft_token_ids,
-            target_argmax,
-            md.segment_ids,
-            md.group_indices,
-            max_draft_tokens,
-            self.step.markers,
-        )
-
-    def finish(self, out: torch.Tensor, max_draft_tokens: int) -> torch.Tensor:
-        out, new_table = thinking_budget.advance_spec_states(
-            self.step.state_table,
-            self.slot_ids,
-            out,
-            max_draft_tokens,
-            self.step.markers,
-        )
-        self.step.commit(new_table)
-        return out
-
-
-def _thinking_budget_step_state_for_runner(
-    runner: Any,
-    batch_req_ids: Sequence[str | None],
-    discard_req_ids: AbstractSet[str],
-    device: torch.device,
-) -> _ThinkingBudgetStepState | None:
-    """Prepare this step's device KMP state table for thinking budgets."""
-    if not isinstance(runner, TPUModelRunner) and not hasattr(
-        runner, "_thinking_budget"
-    ):
-        return None
-    tracker = runner._thinking_budget
-    if not tracker:
-        return None
-    markers = tracker.markers
-    assert markers is not None
-    state_table = tracker.prepare_step(
-        device,
-        batch_req_ids,
-        runner.requests,
-    )
-    if state_table is None:
-        return None
-    return _ThinkingBudgetStepState(tracker, state_table, markers, discard_req_ids)
-
-
-def _apply_plain_thinking_budget(
-    tb_step: _ThinkingBudgetStepState | None,
-    device: torch.device,
-    req_ids: Sequence[str | None],
-    start_idx: int,
-    end_idx: int,
-    selected: torch.Tensor,
-) -> torch.Tensor:
-    if tb_step is None:
-        return selected
-    tb_slot_ids = tb_step.tracker.build_chunk_slot_ids(
-        device,
-        req_ids,
-        start_idx,
-        end_idx,
-        selected.shape[0],
-        tb_step.discard_req_ids,
-    )
-    if tb_slot_ids is None:
-        return selected
-    out_tokens, new_table = thinking_budget.override_and_advance_plain(
-        tb_step.state_table, tb_slot_ids, selected, tb_step.markers
-    )
-    tb_step.commit(new_table)
-    return out_tokens
-
-
-def _precompile_thinking_budget_for_runner(runner: Any) -> None:
-    if isinstance(runner, TPUModelRunner) or hasattr(
-        runner, "_precompile_thinking_budget"
-    ):
-        runner._precompile_thinking_budget()
 
 
 def _validate_libtpu_version() -> None:
@@ -5006,7 +4860,7 @@ class TPUModelRunner(GPUModelRunner):
         sampling_generator: torch.Generator | None,
         top_tokens: bool = False,
         min_toks: min_tokens_mask.MinTokensState | None = None,
-        tb_chunk: _ThinkingBudgetSpecChunk | None = None,
+        tb_chunk: thinking_budget.ThinkingBudgetSpecChunk | None = None,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
@@ -5273,16 +5127,21 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        tb_step = (
-            _thinking_budget_step_state_for_runner(
-                self,
+        tb_step = None
+        if not self.is_pooling_model and state.logits_list and self._thinking_budget:
+            tb_device = state.logits_list[0].device
+            if (
+                self._pre_async_results is not None
+                and self._thinking_budget.needs_output_reseed(req_ids, tb_device)
+            ):
+                self._modify_prev_results()
+                self._pre_async_results = None
+            tb_step = self._thinking_budget.step_state(
+                tb_device,
                 req_ids,
+                self.requests,
                 discard_sampled_tokens_req_ids,
-                state.logits_list[0].device,
             )
-            if not self.is_pooling_model and state.logits_list
-            else None
-        )
         if self.is_pooling_model:
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
@@ -5395,14 +5254,14 @@ class TPUModelRunner(GPUModelRunner):
                                 ),
                                 apply_topk_topp=self._sampler_applies_topk_topp(),
                             )
-                        selected = _apply_plain_thinking_budget(
-                            tb_step,
-                            logits.device,
-                            self.input_batch.req_ids,
-                            cur_start_idx,
-                            cur_end_idx,
-                            selected,
-                        )
+                        if tb_step is not None:
+                            selected = tb_step.apply_plain(
+                                logits.device,
+                                self.input_batch.req_ids,
+                                cur_start_idx,
+                                cur_end_idx,
+                                selected,
+                            )
                     assert self.speculative_config is not None
                     padded = torch.full(
                         (
@@ -5481,14 +5340,14 @@ class TPUModelRunner(GPUModelRunner):
                             ),
                             apply_topk_topp=self._sampler_applies_topk_topp(),
                         )
-                    selected_token_ids = _apply_plain_thinking_budget(
-                        tb_step,
-                        logits.device,
-                        self.input_batch.req_ids,
-                        cur_start_idx,
-                        cur_end_idx,
-                        selected_token_ids,
-                    )
+                    if tb_step is not None:
+                        selected_token_ids = tb_step.apply_plain(
+                            logits.device,
+                            self.input_batch.req_ids,
+                            cur_start_idx,
+                            cur_end_idx,
+                            selected_token_ids,
+                        )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -6851,11 +6710,9 @@ class TPUModelRunner(GPUModelRunner):
                     verify_logits_paddings, "thinking_budget_verify_logits"
                 ),
                 max_draft_tokens=max_draft_tokens,
-                vocab_size=self.vocab_size,
-                logits_dtype=self._hidden_states_dtype,
+                dummy_logits_fn=self._dummy_logits,
                 sync_fn=synchronize_tensors,
                 precompile_top_tokens=self._greedy_head_owner is not None,
-                dummy_logits_fn=getattr(self, "_dummy_logits", None),
             )
 
     def _precompile_min_tokens_mask(self) -> None:
@@ -7239,7 +7096,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_compute_top_tokens()
         self._precompile_structured_decoding()
         self._precompile_min_tokens_mask()
-        _precompile_thinking_budget_for_runner(self)
+        self._precompile_thinking_budget()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 

@@ -39,10 +39,11 @@ if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+    from vllm_torchtpu.runner.speculative_decoding_manager import SpecDecodeMetadata
+
 logger = init_logger(__name__)
 
 INT32_MAX: Final[int] = 2_147_483_647
-_AMAX_SENTINEL: Final[int] = -2_147_483_647
 NO_FORCED_TOKEN: Final[int] = -1
 _MAX_SLOT_UPLOAD_CACHE: Final[int] = 32
 
@@ -203,16 +204,18 @@ def advance_sequence_state(
     tokens: Sequence[int] | np.ndarray,
     markers: ThinkingBudgetMarkers,
 ) -> StateTuple:
-    """Advance ``state`` across ``tokens``, skipping non-marker spans in C/SIMD.
+    """Advance ``state`` across ``tokens``, jumping directly between marker hits.
 
     Whenever partial multi-token marker state is clear
     (``start_match == nat_end_match == end_match == forcing_end == 0``), no
     token outside ``{start_ids[0]}`` can change any state column while
     ``in_think == 0``, and while ``in_think == 1`` a run of ``k`` tokens outside
-    ``{natural_end_ids[0], end_ids[0]}`` strictly advances ``think_count`` to
-    ``min(think_count + k, INT32_MAX)``. Monotonic ``list.index`` / NumPy
-    ``flatnonzero`` jumps keep 128K-token prompt/resume seeding ~1 ms on host
-    with $O(n)$ worst-case complexity and zero list copies.
+    ``{natural_end_ids[0], end_ids[0]}`` only advances ``think_count`` to
+    ``min(think_count + k, INT32_MAX)``. For sequences of at least 32 tokens,
+    monotonic ``list.index`` lookups (for ``list`` / ``tuple`` inputs) or
+    ``np.flatnonzero`` over candidate first-token positions (for array inputs)
+    skip non-marker spans in linear worst-case time without copying ``list``
+    or ``tuple`` inputs.
     """
     if state[COL_BUDGET] < 0:
         return UNTRACKED_STATE
@@ -318,6 +321,19 @@ def _compute_request_state(
     budget: int,
     markers: ThinkingBudgetMarkers,
 ) -> StateTuple:
+    """Reconstruct KMP state from ``req_state``'s prompt and committed outputs.
+
+    Placeholder invariants:
+    * ``on_resumed`` runs in ``TPUModelRunner._update_states`` after
+      ``super()._update_states`` overwrites ``req_state.output_token_ids`` from
+      the scheduler's ``all_token_ids``, where async placeholders are ``-1``
+      (filtered out by ``out_arr >= 0`` below).
+    * ``prepare_step`` only calls ``_compute_request_state`` on a cold reseed
+      when a budgeted request has neither an allocated slot nor a seeded
+      ``_dirty_states`` entry; ``TPUModelRunner.sample_tokens`` settles any
+      in-flight ``_pre_async_results`` (``[0] * n_new`` placeholders) via
+      ``_modify_prev_results`` whenever ``needs_output_reseed`` is true.
+    """
     if req_state is None:
         return compute_sequence_state((), budget, markers)
     state = compute_sequence_state(req_state.prompt_token_ids or (), budget, markers)
@@ -458,38 +474,29 @@ def _scatter_state_rows(
 ) -> torch.Tensor:
     """Return ``state_table`` with ``out[slot_ids[i]] = rows[i]`` for active slots.
 
-    Why one-hot ``[capacity, num_reqs, 7]`` mask + ``amax`` instead of
-    ``scatter`` / ``index_put``:
-    * Inactive/padded lanes carry ``slot_ids[i] == 0``. ``Tensor.scatter`` along
-      dim 0 would issue duplicate writes to sentinel row 0 across padded lanes
-      (lowering to ``stablehlo.scatter`` with duplicate-key combiner semantics),
-      while ``index_put`` adds dynamic-index functionalization overhead under
-      ``@torch.compile(backend="tpu", fullgraph=True, dynamic=False)``.
-    * With ``capacity = max_num_reqs + 1``, ``[capacity, num_reqs, 7]`` is tiny
-      (e.g. <1 MB at ``max_num_reqs = 256``) and lowers to pure broadcast +
-      ``where`` + ``reduce_max``.
-
-    Invariants:
-    * Each positive slot (``slot_ids[i] > 0``) MUST appear at most once per
-      call (each tracked ``req_id`` owns a unique slot and appears at most once
-      in a seed or batch chunk); duplicate positive slots would combine via
-      ``amax``.
-    * Every valid column entry in ``rows`` exceeds ``_AMAX_SENTINEL``
-      (``-2_147_483_647``; minimum valid value is ``UNTRACKED_STATE[0] == -1``).
+    Inactive/padded lanes carry ``slot_ids[i] <= 0`` and are routed to sentinel
+    row ``0`` writing constant ``UNTRACKED_STATE`` (matching the out-of-bounds
+    sink pattern in ``_spec_logprob_row_tokens``), keeping work and temporary
+    memory linear in ``capacity + num_reqs`` rather than quadratic in
+    ``max_num_reqs``. Each positive slot ``slot_ids[i] > 0`` must appear at most
+    once per call.
     """
     if state_table.device.type == "cpu" and not torch.compiler.is_compiling():
         pos_slots = slot_ids[slot_ids > 0]
         assert pos_slots.numel() == torch.unique(pos_slots).numel(), (
             "Duplicate positive slot IDs passed to _scatter_state_rows"
         )
-    table_idx = torch.arange(
-        state_table.shape[0], dtype=slot_ids.dtype, device=state_table.device
-    ).unsqueeze(1)
-    match = (slot_ids > 0).unsqueeze(0) & (table_idx == slot_ids.unsqueeze(0))
-    cand = torch.where(match.unsqueeze(-1), rows.unsqueeze(0), _AMAX_SENTINEL).amax(
-        dim=1
+    active = slot_ids > 0
+    safe_slots = torch.where(active, slot_ids, 0).to(torch.int64)
+    col_idx = torch.arange(
+        NUM_STATE_COLS, dtype=state_table.dtype, device=state_table.device
+    ).unsqueeze(0)
+    untracked_row = torch.where(col_idx == COL_BUDGET, -1, 0).to(state_table.dtype)
+    safe_rows = torch.where(
+        active.unsqueeze(-1), rows.to(state_table.dtype), untracked_row
     )
-    return torch.where(match.any(dim=1, keepdim=True), cand, state_table)
+    idx = safe_slots.unsqueeze(-1).expand(-1, NUM_STATE_COLS)
+    return state_table.scatter(0, idx, safe_rows)
 
 
 def _seed_states_impl(
@@ -566,32 +573,34 @@ def _prepare_spec_verify_drafts(
     no_tok = torch.full_like(draft_i32, NO_FORCED_TOKEN)
 
     if max_draft_tokens > 0:
+        num_cells = num_reqs * max_draft_tokens
+        seg_in_range = (segment_ids >= 0) & (segment_ids < num_reqs)
+        safe_seg = torch.where(seg_in_range, segment_ids, 0).to(torch.int64)
+        seg_active = seg_in_range & (torch.index_select(slot_ids, 0, safe_seg) > 0)
         in_bounds = (
-            (segment_ids >= 0)
-            & (segment_ids < num_reqs)
-            & (group_indices >= 0)
-            & (group_indices < max_draft_tokens)
+            seg_active & (group_indices >= 0) & (group_indices < max_draft_tokens)
         )
-        safe_seg = torch.where(
-            in_bounds, segment_ids, torch.zeros_like(segment_ids)
-        ).to(torch.int64)
-        safe_grp = torch.where(
-            in_bounds, group_indices, torch.zeros_like(group_indices)
-        ).to(torch.int64)
+        safe_grp = torch.where(in_bounds, group_indices, 0).to(torch.int64)
         flat_idx = safe_seg * max_draft_tokens + safe_grp
-        cells = torch.arange(
-            num_reqs * max_draft_tokens,
-            dtype=torch.int64,
-            device=state_table.device,
-        ).unsqueeze(1)
-        cell_match = in_bounds.unsqueeze(0) & (cells == flat_idx.unsqueeze(0))
-        any_cell = cell_match.any(dim=1)
-        has_draft = any_cell.reshape(num_reqs, max_draft_tokens)
-        draft_grid = torch.where(
-            any_cell,
-            torch.where(cell_match, draft_i32.unsqueeze(0), _AMAX_SENTINEL).amax(dim=1),
+        if state_table.device.type == "cpu" and not torch.compiler.is_compiling():
+            valid_cells = flat_idx[in_bounds]
+            assert valid_cells.numel() == torch.unique(valid_cells).numel(), (
+                "Duplicate active (segment_id, group_index) in "
+                "_prepare_spec_verify_drafts"
+            )
+        # Route unbudgeted and padded positions (`segment_ids == real_num_reqs`,
+        # where `slot_ids[real_num_reqs] == 0`) to sentinel cell `num_cells` and
+        # slice it off, keeping memory/work linear in `num_tokens + num_cells`.
+        dest_idx = torch.where(in_bounds, flat_idx, num_cells)
+        draft_buf = torch.full(
+            (num_cells + 1,),
             NO_FORCED_TOKEN,
-        ).reshape(num_reqs, max_draft_tokens)
+            dtype=torch.int32,
+            device=state_table.device,
+        )
+        draft_grid = draft_buf.scatter(
+            0, dest_idx, torch.where(in_bounds, draft_i32, no_tok)
+        )[:num_cells].reshape(num_reqs, max_draft_tokens)
 
         no_req_tok = torch.full(
             (num_reqs,), NO_FORCED_TOKEN, dtype=torch.int32, device=state_table.device
@@ -603,7 +612,7 @@ def _prepare_spec_verify_drafts(
             )
             forced_cols.append(step_forced_req)
             d_tok = draft_grid[:, step_idx]
-            step_active = active_slot & has_draft[:, step_idx] & (d_tok >= 0)
+            step_active = active_slot & (d_tok >= 0)
             next_st = _advance_state_tensor(
                 st,
                 d_tok,
@@ -997,13 +1006,18 @@ class ThinkingBudgetTracker:
         sampling_params: "SamplingParams | None",
         prompt_token_ids: Sequence[int] | None,
     ) -> None:
-        if self._markers is None:
-            return
         raw_budget = (
             None if sampling_params is None else sampling_params.thinking_token_budget
         )
         if raw_budget is None or raw_budget < 0:
-            self.discard((req_id,))
+            if self._budgets:
+                self.discard((req_id,))
+            return
+        if self._markers is None:
+            logger.warning_once(
+                "Ignoring thinking_token_budget because reasoning start/end "
+                "token IDs are not configured on the model runner."
+            )
             return
         clamped_budget = min(int(raw_budget), INT32_MAX)
         self._budgets[req_id] = clamped_budget
@@ -1011,6 +1025,42 @@ class ThinkingBudgetTracker:
             prompt_token_ids or (), clamped_budget, self._markers
         )
         self._bump_epoch()
+
+    def needs_output_reseed(
+        self,
+        batch_req_ids: Iterable[str | None],
+        device: torch.device | None = None,
+    ) -> bool:
+        """Return True if ``prepare_step`` will read ``output_token_ids``."""
+        if self._markers is None or not self._budgets:
+            return False
+        slots_valid = self._state_table is None or (
+            device is None or _same_target_device(self._state_table.device, device)
+        )
+        return any(
+            req_id is not None
+            and req_id in self._budgets
+            and (not slots_valid or req_id not in self._slot_by_req_id)
+            and req_id not in self._dirty_states
+            for req_id in batch_req_ids
+        )
+
+    def step_state(
+        self,
+        device: torch.device,
+        batch_req_ids: Sequence[str | None],
+        requests: Mapping[str, "CachedRequestState"],
+        discard_req_ids: AbstractSet[str],
+    ) -> "ThinkingBudgetStepState | None":
+        """Prepare this step's device KMP state for ``sample_tokens``."""
+        if not self:
+            return None
+        markers = self._markers
+        assert markers is not None
+        state_table = self.prepare_step(device, batch_req_ids, requests)
+        if state_table is None:
+            return None
+        return ThinkingBudgetStepState(self, state_table, markers, discard_req_ids)
 
     def on_resumed(
         self,
@@ -1210,11 +1260,9 @@ class ThinkingBudgetTracker:
         num_reqs_paddings: Sequence[int],
         verify_logits_paddings: Sequence[int],
         max_draft_tokens: int,
-        vocab_size: int,
-        logits_dtype: torch.dtype,
+        dummy_logits_fn: Callable[[int], torch.Tensor],
         sync_fn: Callable[..., None],
         precompile_top_tokens: bool = False,
-        dummy_logits_fn: Callable[[int], torch.Tensor] | None = None,
     ) -> None:
         """Pre-warm all thinking-budget subgraphs across compiled bucket shapes."""
         if self._markers is None:
@@ -1251,13 +1299,7 @@ class ThinkingBudgetTracker:
                 (num_tokens,), self._max_num_reqs, dtype=torch.int64
             ).to(device)
             grp_ids = torch.zeros(num_tokens, dtype=torch.int32).to(device)
-            logits = (
-                dummy_logits_fn(num_tokens)
-                if dummy_logits_fn is not None
-                else torch.zeros((num_tokens, vocab_size), dtype=logits_dtype).to(
-                    device
-                )
-            )
+            logits = dummy_logits_fn(num_tokens)
             out_logits, eff_drafts = prepare_spec_verify_logits(
                 state_table,
                 spec_slots,
@@ -1296,3 +1338,116 @@ class ThinkingBudgetTracker:
             )
             sync_fn([out_spec, state_table])
         self._state_table = state_table
+
+
+@dataclass
+class ThinkingBudgetStepState:
+    """Per-step thinking-budget state threaded through ``sample_tokens``."""
+
+    tracker: ThinkingBudgetTracker
+    state_table: torch.Tensor
+    markers: ThinkingBudgetMarkers
+    discard_req_ids: AbstractSet[str]
+
+    def commit(self, state_table: torch.Tensor) -> None:
+        self.state_table = state_table
+        self.tracker.commit_state_table(state_table)
+
+    def apply_plain(
+        self,
+        device: torch.device,
+        req_ids: Sequence[str | None],
+        start_idx: int,
+        end_idx: int,
+        selected: torch.Tensor,
+    ) -> torch.Tensor:
+        slot_ids = self.tracker.build_chunk_slot_ids(
+            device,
+            req_ids,
+            start_idx,
+            end_idx,
+            selected.shape[0],
+            self.discard_req_ids,
+        )
+        if slot_ids is None:
+            return selected
+        out_tokens, new_table = override_and_advance_plain(
+            self.state_table, slot_ids, selected, self.markers
+        )
+        self.commit(new_table)
+        return out_tokens
+
+    def spec_chunk(
+        self,
+        device: torch.device,
+        req_ids: Sequence[str | None],
+        start_idx: int,
+        end_idx: int,
+        min_slot_len: int,
+    ) -> "ThinkingBudgetSpecChunk | None":
+        slot_ids = self.tracker.build_chunk_slot_ids(
+            device,
+            req_ids,
+            start_idx,
+            end_idx,
+            max(self.tracker.max_num_reqs, min_slot_len),
+            self.discard_req_ids,
+        )
+        if slot_ids is None:
+            return None
+        return ThinkingBudgetSpecChunk(step=self, slot_ids=slot_ids)
+
+
+@dataclass(frozen=True)
+class ThinkingBudgetSpecChunk:
+    """Per-chunk speculative verification state for thinking budgets."""
+
+    step: ThinkingBudgetStepState
+    slot_ids: torch.Tensor
+
+    def prepare_logits(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_logits: torch.Tensor,
+        md: "SpecDecodeMetadata",
+        max_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return prepare_spec_verify_logits(
+            self.step.state_table,
+            self.slot_ids,
+            draft_token_ids,
+            target_logits,
+            md.segment_ids,
+            md.group_indices,
+            max_draft_tokens,
+            self.step.markers,
+        )
+
+    def prepare_tokens(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_argmax: torch.Tensor,
+        md: "SpecDecodeMetadata",
+        max_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return prepare_spec_verify_tokens(
+            self.step.state_table,
+            self.slot_ids,
+            draft_token_ids,
+            target_argmax,
+            md.segment_ids,
+            md.group_indices,
+            max_draft_tokens,
+            self.step.markers,
+        )
+
+    def finish(self, out: torch.Tensor, max_draft_tokens: int) -> torch.Tensor:
+        out, new_table = advance_spec_states(
+            self.step.state_table,
+            self.slot_ids,
+            out,
+            max_draft_tokens,
+            self.step.markers,
+        )
+        self.step.commit(new_table)
+        return out
