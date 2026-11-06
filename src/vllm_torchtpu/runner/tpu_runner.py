@@ -26,6 +26,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -531,16 +532,90 @@ class _ThinkingBudgetStepState:
     tracker: thinking_budget.ThinkingBudgetTracker
     state_table: torch.Tensor
     markers: thinking_budget.ThinkingBudgetMarkers
-    is_partial_prefill: Callable[[str], bool]
+    discard_req_ids: AbstractSet[str]
 
     def commit(self, state_table: torch.Tensor) -> None:
         self.state_table = state_table
         self.tracker.commit_state_table(state_table)
 
+    def spec_chunk(
+        self,
+        device: torch.device,
+        req_ids: Sequence[str | None],
+        start_idx: int,
+        end_idx: int,
+        min_slot_len: int,
+    ) -> "_ThinkingBudgetSpecChunk | None":
+        slot_ids = self.tracker.build_chunk_slot_ids(
+            device,
+            req_ids,
+            start_idx,
+            end_idx,
+            max(self.tracker.max_num_reqs, min_slot_len),
+            self.discard_req_ids,
+        )
+        if slot_ids is None:
+            return None
+        return _ThinkingBudgetSpecChunk(step=self, slot_ids=slot_ids)
+
+
+@dataclass(frozen=True)
+class _ThinkingBudgetSpecChunk:
+    step: _ThinkingBudgetStepState
+    slot_ids: torch.Tensor
+
+    def prepare_logits(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        max_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return thinking_budget.prepare_spec_verify_logits(
+            self.step.state_table,
+            self.slot_ids,
+            draft_token_ids,
+            target_logits,
+            md.segment_ids,
+            md.group_indices,
+            max_draft_tokens,
+            self.step.markers,
+        )
+
+    def prepare_tokens(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_argmax: torch.Tensor,
+        md: SpecDecodeMetadata,
+        max_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return thinking_budget.prepare_spec_verify_tokens(
+            self.step.state_table,
+            self.slot_ids,
+            draft_token_ids,
+            target_argmax,
+            md.segment_ids,
+            md.group_indices,
+            max_draft_tokens,
+            self.step.markers,
+        )
+
+    def finish(self, out: torch.Tensor, max_draft_tokens: int) -> torch.Tensor:
+        out, new_table = thinking_budget.advance_spec_states(
+            self.step.state_table,
+            self.slot_ids,
+            out,
+            max_draft_tokens,
+            self.step.markers,
+        )
+        self.step.commit(new_table)
+        return out
+
 
 def _thinking_budget_step_state_for_runner(
     runner: Any,
-    scheduler_output: "SchedulerOutput",
+    batch_req_ids: Sequence[str | None],
+    discard_req_ids: AbstractSet[str],
     device: torch.device,
 ) -> _ThinkingBudgetStepState | None:
     """Prepare this step's device KMP state table for thinking budgets."""
@@ -553,7 +628,6 @@ def _thinking_budget_step_state_for_runner(
         return None
     markers = tracker.markers
     assert markers is not None
-    batch_req_ids = runner.input_batch.req_ids[: runner.input_batch.num_reqs]
     state_table = tracker.prepare_step(
         device,
         batch_req_ids,
@@ -561,15 +635,7 @@ def _thinking_budget_step_state_for_runner(
     )
     if state_table is None:
         return None
-
-    def is_partial_prefill(req_id: str) -> bool:
-        req_state = runner.requests.get(req_id)
-        if req_state is None:
-            return False
-        scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-        return req_state.num_computed_tokens + scheduled < req_state.num_tokens
-
-    return _ThinkingBudgetStepState(tracker, state_table, markers, is_partial_prefill)
+    return _ThinkingBudgetStepState(tracker, state_table, markers, discard_req_ids)
 
 
 def _apply_plain_thinking_budget(
@@ -588,7 +654,7 @@ def _apply_plain_thinking_budget(
         start_idx,
         end_idx,
         selected.shape[0],
-        tb_step.is_partial_prefill,
+        tb_step.discard_req_ids,
     )
     if tb_slot_ids is None:
         return selected
@@ -597,35 +663,6 @@ def _apply_plain_thinking_budget(
     )
     tb_step.commit(new_table)
     return out_tokens
-
-
-def _spec_verify_bucket_pairs_for_runner(runner: Any) -> list[tuple[int, int]]:
-    """Reachable ``(padded_logits_length, padded_num_reqs)`` verify pairs."""
-    if runner.speculative_config is None or getattr(runner, "_mtp_prefill_only", False):
-        return []
-    k = runner.speculative_config.num_speculative_tokens
-    # The verify chunk samples at most num_reqs*(K+1) positions; bound the
-    # padded_logits_length sweep to the bucket that covers the full batch.
-    # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
-    # (which is the largest bucket), and logits rows never exceed the largest
-    # bucket.
-    max_logits_len = _get_padded_token_len(
-        runner.num_tokens_paddings,
-        min(runner.max_num_reqs * (k + 1), runner.num_tokens_paddings[-1]),
-    )
-    # The (padded_logits_length, padded_num_reqs) shapes, in the order
-    # the runtime buckets follow.
-    pairs: list[tuple[int, int]] = []
-    for num_tokens in runner.num_tokens_paddings:
-        if num_tokens > max_logits_len:
-            break
-        for num_reqs in runner.num_reqs_paddings:
-            if not runner._spec_verify_bucket_reachable(num_tokens, num_reqs):
-                continue
-            pairs.append((num_tokens, num_reqs))
-            if num_reqs >= min(num_tokens, runner.max_num_reqs):
-                break
-    return pairs
 
 
 def _precompile_thinking_budget_for_runner(runner: Any) -> None:
@@ -4969,10 +5006,7 @@ class TPUModelRunner(GPUModelRunner):
         sampling_generator: torch.Generator | None,
         top_tokens: bool = False,
         min_toks: min_tokens_mask.MinTokensState | None = None,
-        tb_state_table: torch.Tensor | None = None,
-        tb_slot_ids: torch.Tensor | None = None,
-        tb_markers: thinking_budget.ThinkingBudgetMarkers | None = None,
-        tb_commit: Callable[[torch.Tensor], None] | None = None,
+        tb_chunk: _ThinkingBudgetSpecChunk | None = None,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
@@ -4982,78 +5016,40 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
 
-        def _prepare_tb(
-            draft_ids: torch.Tensor,
-        ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-            if tb_state_table is None or tb_slot_ids is None or tb_markers is None:
-                return None, None, draft_ids
-            assert self.speculative_config is not None
-            return thinking_budget.prepare_spec_verify(
-                tb_state_table,
-                tb_slot_ids,
-                draft_ids,
-                md.draft_lengths,
-                md.segment_ids,
-                md.group_indices,
-                self.speculative_config.num_speculative_tokens,
-                tb_markers,
-            )
-
-        def _finish(out: torch.Tensor) -> torch.Tensor:
-            if (
-                tb_state_table is not None
-                and tb_slot_ids is not None
-                and tb_markers is not None
-            ):
-                assert self.speculative_config is not None
-                out, new_table = thinking_budget.advance_spec_states(
-                    tb_state_table,
-                    tb_slot_ids,
-                    out,
-                    self.speculative_config.num_speculative_tokens,
-                    tb_markers,
-                )
-                if tb_commit is not None:
-                    tb_commit(new_table)
-            return out
-
         if top_tokens:
             assert self.rejection_sampler is not None
             assert self.speculative_config is not None
-            forced_target_ids, forced_bonus_ids, draft_token_ids = _prepare_tb(
-                md.draft_token_ids
-            )
+            max_draft_tokens = self.speculative_config.num_speculative_tokens
             bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
-            if forced_target_ids is not None and forced_bonus_ids is not None:
-                target_argmax = thinking_budget.force_token_ids_1d(
-                    target_argmax, forced_target_ids
+            draft_token_ids = md.draft_token_ids
+            if tb_chunk is not None:
+                target_argmax, draft_token_ids = tb_chunk.prepare_tokens(
+                    draft_token_ids, target_argmax, md, max_draft_tokens
                 )
-                bonus_token_ids = thinking_budget.force_token_ids_1d(
-                    bonus_token_ids, forced_bonus_ids
-                )
-            return _finish(
-                self.rejection_sampler(
-                    draft_token_ids=draft_token_ids,
-                    num_draft_tokens=md.draft_lengths,
-                    target_logits=None,
-                    bonus_token_ids=bonus_token_ids,
-                    segment_ids=md.segment_ids,
-                    group_indices=md.group_indices,
-                    max_draft_tokens=self.speculative_config.num_speculative_tokens,
-                    accept_u=(
-                        torch.rand(
-                            draft_token_ids.shape,
-                            dtype=torch.float32,
-                            device=logits.device,
-                            generator=sampling_generator,
-                        )
-                        if self.rejection_sampler.synthetic_mode
-                        else None
-                    ),
-                    target_argmax=target_argmax,
-                )
+            out = self.rejection_sampler(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=None,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=max_draft_tokens,
+                accept_u=(
+                    torch.rand(
+                        draft_token_ids.shape,
+                        dtype=torch.float32,
+                        device=logits.device,
+                        generator=sampling_generator,
+                    )
+                    if self.rejection_sampler.synthetic_mode
+                    else None
+                ),
+                target_argmax=target_argmax,
+            )
+            return (
+                tb_chunk.finish(out, max_draft_tokens) if tb_chunk is not None else out
             )
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
@@ -5138,19 +5134,14 @@ class TPUModelRunner(GPUModelRunner):
                     topk_candidates=topk_candidates,
                     apply_topk_topp=self._sampler_applies_topk_topp(),
                 ).view(-1)
-        forced_target_ids, forced_bonus_ids, draft_token_ids = _prepare_tb(
-            draft_token_ids
-        )
-        if forced_target_ids is not None and forced_bonus_ids is not None:
-            target_logits = thinking_budget.force_logits_rows(
-                target_logits, forced_target_ids
-            )
-            bonus_token_ids = thinking_budget.force_token_ids_1d(
-                bonus_token_ids, forced_bonus_ids
-            )
         accept_u = None
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
+        max_draft_tokens = self.speculative_config.num_speculative_tokens
+        if tb_chunk is not None:
+            target_logits, draft_token_ids = tb_chunk.prepare_logits(
+                draft_token_ids, target_logits, md, max_draft_tokens
+            )
         if self.rejection_sampler.synthetic_mode or not all_greedy:
             accept_u = torch.rand(
                 draft_token_ids.shape,
@@ -5159,17 +5150,18 @@ class TPUModelRunner(GPUModelRunner):
                 generator=sampling_generator,
             )
         if all_greedy:
-            return _finish(
-                self.rejection_sampler(
-                    draft_token_ids=draft_token_ids,
-                    num_draft_tokens=md.draft_lengths,
-                    target_logits=target_logits,
-                    bonus_token_ids=bonus_token_ids,
-                    segment_ids=md.segment_ids,
-                    group_indices=md.group_indices,
-                    max_draft_tokens=self.speculative_config.num_speculative_tokens,
-                    accept_u=accept_u,
-                )
+            out = self.rejection_sampler(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=max_draft_tokens,
+                accept_u=accept_u,
+            )
+            return (
+                tb_chunk.finish(out, max_draft_tokens) if tb_chunk is not None else out
             )
         assert accept_u is not None
         assert req_temperatures is not None
@@ -5178,25 +5170,24 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
-        return _finish(
-            self.rejection_sampler(
-                draft_token_ids=draft_token_ids,
-                num_draft_tokens=md.draft_lengths,
-                target_logits=target_logits,
-                bonus_token_ids=bonus_token_ids,
-                segment_ids=md.segment_ids,
-                group_indices=md.group_indices,
-                max_draft_tokens=self.speculative_config.num_speculative_tokens,
-                temperatures=req_temperatures[md.segment_ids],
-                top_k=req_top_k[md.segment_ids],
-                top_p=req_top_p[md.segment_ids],
-                accept_u=accept_u,
-                recover_u=recover_u,
-                do_sampling=True,
-                topk_candidates=topk_candidates,
-                apply_topk_topp=self._sampler_applies_topk_topp(),
-            )
+        out = self.rejection_sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=md.draft_lengths,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=md.segment_ids,
+            group_indices=md.group_indices,
+            max_draft_tokens=max_draft_tokens,
+            temperatures=req_temperatures[md.segment_ids],
+            top_k=req_top_k[md.segment_ids],
+            top_p=req_top_p[md.segment_ids],
+            accept_u=accept_u,
+            recover_u=recover_u,
+            do_sampling=True,
+            topk_candidates=topk_candidates,
+            apply_topk_topp=self._sampler_applies_topk_topp(),
         )
+        return tb_chunk.finish(out, max_draft_tokens) if tb_chunk is not None else out
 
     @_pp_step
     def sample_tokens(
@@ -5263,17 +5254,36 @@ class TPUModelRunner(GPUModelRunner):
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
+        discard_sampled_tokens_req_indices: list[int] = []
+        discard_sampled_tokens_req_ids: set[str] = set()
+        req_ids = cast(list[str], self.input_batch.req_ids[: self.input_batch.num_reqs])
+        request_seq_lens = []
+        for i, req_id in enumerate(req_ids):
+            assert req_id is not None
+            req_state = self.requests[req_id]
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            if seq_len < req_state.num_tokens:
+                # Record the index and ID of partial-prefill requests whose
+                # sampled tokens are discarded.
+                discard_sampled_tokens_req_indices.append(i)
+                discard_sampled_tokens_req_ids.add(req_id)
+            else:
+                request_seq_lens.append((i, req_state, seq_len, req_id))
+
         tb_step = (
             _thinking_budget_step_state_for_runner(
-                self, scheduler_output, state.logits_list[0].device
+                self,
+                req_ids,
+                discard_sampled_tokens_req_ids,
+                state.logits_list[0].device,
             )
             if not self.is_pooling_model and state.logits_list
             else None
         )
         if self.is_pooling_model:
-            req_ids = cast(
-                list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
-            )
             self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
             cur_start_idx = 0
@@ -5286,47 +5296,31 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
-                    tb_slot_ids: torch.Tensor | None = None
-                    if tb_step is not None:
-                        tb_slot_ids = tb_step.tracker.build_chunk_slot_ids(
+                    tb_chunk = (
+                        tb_step.spec_chunk(
                             logits.device,
                             self.input_batch.req_ids,
                             cur_start_idx,
                             cur_end_idx,
                             md.draft_lengths.shape[0],
-                            tb_step.is_partial_prefill,
                         )
+                        if tb_step is not None
+                        else None
+                    )
                     with self._stage_timing.stage("sample"):
-                        if tb_step is not None and tb_slot_ids is not None:
-                            next_tokens = self._sample_spec_verify_chunk(
-                                logits,
-                                md,
-                                grammar_output,
-                                scheduler_output,
-                                cur_start_idx,
-                                cur_end_idx,
-                                all_greedy,
-                                sampling_generator,
-                                state.top_tokens,
-                                min_toks,
-                                tb_step.state_table,
-                                tb_slot_ids,
-                                tb_step.markers,
-                                tb_step.commit,
-                            )
-                        else:
-                            next_tokens = self._sample_spec_verify_chunk(
-                                logits,
-                                md,
-                                grammar_output,
-                                scheduler_output,
-                                cur_start_idx,
-                                cur_end_idx,
-                                all_greedy,
-                                sampling_generator,
-                                state.top_tokens,
-                                min_toks,
-                            )
+                        next_tokens = self._sample_spec_verify_chunk(
+                            logits,
+                            md,
+                            grammar_output,
+                            scheduler_output,
+                            cur_start_idx,
+                            cur_end_idx,
+                            all_greedy,
+                            sampling_generator,
+                            state.top_tokens,
+                            min_toks,
+                            tb_chunk,
+                        )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
@@ -5437,9 +5431,6 @@ class TPUModelRunner(GPUModelRunner):
                 cur_start_idx = cur_end_idx
         else:
             cur_start_idx = 0
-            req_ids = cast(
-                list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
-            )
             all_greedy = self.input_batch.all_greedy
             for logits, num_reqs, mamba_indices in zip(
                 state.logits_list, state.num_reqs_list, mamba_idx_list
@@ -5559,30 +5550,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             logprobs = logprobs_lists
 
-        discard_sampled_tokens_req_indices = []
-        num_reqs = self.input_batch.num_reqs
-        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
-
-        request_seq_lens = []
-        for i, req_id in enumerate(req_ids):
-            assert req_id is not None
-            req_state = self.requests[req_id]
-            seq_len = (
-                req_state.num_computed_tokens
-                + scheduler_output.num_scheduled_tokens[req_id]
-            )
-            # Ignore the sampled token from the partial request.
-            # Rewind the generator state as if the token was not sampled.
-            if seq_len < req_state.num_tokens:
-                generator = self.input_batch.generators.get(i)
-                if generator is not None:
-                    # This relies on cuda-specific torch-internal impl details
-                    generator.set_offset(generator.get_offset() - 4)
-                # Record the index of the request that should not be sampled,
-                # so that we could clear the sampled tokens before returning.
-                discard_sampled_tokens_req_indices.append(i)
-            else:
-                request_seq_lens.append((i, req_state, seq_len, req_id))
+        # Ignore the sampled token from the partial request.
+        # Rewind the generator state as if the token was not sampled.
+        for i in discard_sampled_tokens_req_indices:
+            generator = self.input_batch.generators.get(i)
+            if generator is not None:
+                # This relies on cuda-specific torch-internal impl details
+                generator.set_offset(generator.get_offset() - 4)
 
         next_tokens_tpu = None
         copy_state = None
@@ -6858,10 +6832,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         return [n for n in self.num_tokens_paddings if n <= max_target_rows]
 
-    def _spec_verify_bucket_pairs(self) -> list[tuple[int, int]]:
-        """Reachable ``(padded_logits_length, padded_num_reqs)`` verify pairs."""
-        return _spec_verify_bucket_pairs_for_runner(self)
-
     def _precompile_thinking_budget(self) -> None:
         if self._thinking_budget is None or not self._thinking_budget.enabled:
             return
@@ -6871,9 +6841,6 @@ class TPUModelRunner(GPUModelRunner):
             else 0
         )
         verify_logits_paddings = self._verify_logits_paddings()
-        token_1d_paddings = sorted(
-            set(self.num_reqs_paddings) | set(verify_logits_paddings)
-        )
         with self._precompile_timed("thinking_budget"):
             self._thinking_budget.precompile(
                 device=self.device,
@@ -6883,16 +6850,11 @@ class TPUModelRunner(GPUModelRunner):
                 verify_logits_paddings=_rotate_precompile_sweep(
                     verify_logits_paddings, "thinking_budget_verify_logits"
                 ),
-                spec_verify_pairs=_rotate_precompile_sweep(
-                    self._spec_verify_bucket_pairs(), "thinking_budget_spec_verify"
-                ),
-                token_1d_paddings=_rotate_precompile_sweep(
-                    token_1d_paddings, "thinking_budget_token_1d"
-                ),
                 max_draft_tokens=max_draft_tokens,
                 vocab_size=self.vocab_size,
                 logits_dtype=self._hidden_states_dtype,
                 sync_fn=synchronize_tensors,
+                precompile_top_tokens=self._greedy_head_owner is not None,
                 dummy_logits_fn=getattr(self, "_dummy_logits", None),
             )
 
@@ -7070,9 +7032,28 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.rejection_sampler is not None
         k = self.speculative_config.num_speculative_tokens
-        pairs = _rotate_precompile_sweep(
-            _spec_verify_bucket_pairs_for_runner(self), "rejection_sampler"
+        # The verify chunk samples at most num_reqs*(K+1) positions; bound the
+        # padded_logits_length sweep to the bucket that covers the full batch.
+        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
+        # (which is the largest bucket), and logits rows never exceed the largest
+        # bucket.
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
         )
+        # The (padded_logits_length, padded_num_reqs) shapes, in the order
+        # the runtime buckets follow.
+        pairs = []
+        for num_tokens in self.num_tokens_paddings:
+            if num_tokens > max_logits_len:
+                break
+            for num_reqs in self.num_reqs_paddings:
+                if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
+                    continue
+                pairs.append((num_tokens, num_reqs))
+                if num_reqs >= min(num_tokens, self.max_num_reqs):
+                    break
+        pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is

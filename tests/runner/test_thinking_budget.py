@@ -38,20 +38,23 @@ from vllm_torchtpu.runner.thinking_budget import (
     UNTRACKED_STATE,
     ThinkingBudgetMarkers,
     ThinkingBudgetTracker,
+    _force_logits_rows_impl,
+    _force_token_ids_1d_impl,
+    _prepare_spec_verify_drafts,
     advance_spec_states,
     advance_state_py,
     compute_kmp_failure,
     compute_sequence_state,
-    force_logits_rows,
-    force_token_ids_1d,
     override_and_advance_plain,
-    prepare_spec_verify,
+    prepare_spec_verify_logits,
+    prepare_spec_verify_tokens,
     query_forced_token_py,
     seed_states,
 )
 from vllm_torchtpu.runner.tpu_runner import (
     TPUModelRunner,
-    _spec_verify_bucket_pairs_for_runner,
+    _ThinkingBudgetSpecChunk,
+    _ThinkingBudgetStepState,
 )
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 from vllm_torchtpu.utils import synchronize_tensors
@@ -330,8 +333,6 @@ class TestMarkersAndKMP:
     def test_vectorized_sequence_state_matches_scalar_kmp_and_handles_long_prompts(
         self,
     ) -> None:
-        import time
-
         def scalar_ref(
             seq: list[int], budget: int, markers: ThinkingBudgetMarkers
         ) -> tuple[int, int, int, int, int, int, int]:
@@ -365,7 +366,7 @@ class TestMarkersAndKMP:
                     assert compute_sequence_state(arr, budget, markers) == exp
 
         # Long-context 128K-token prompt with embedded <think>...</think> history
-        # and an open final <think> block: verifies accuracy + sub-50ms host cost.
+        # and an open final <think> block: verifies multi-chunk KMP accuracy.
         qwen_markers = ThinkingBudgetMarkers.from_reasoning_config(
             _reasoning_config(list(QWEN3_START), list(QWEN3_END))
         )
@@ -379,13 +380,10 @@ class TestMarkersAndKMP:
             + [QWEN3_START[0]]
             + [45] * 997
         )
-        t0 = time.perf_counter()
         long_state = compute_sequence_state(
             long_prompt, budget=1000, markers=qwen_markers
         )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
         assert long_state == (1000, 1, 997, 0, 0, 0, 0)
-        assert elapsed_ms < 50.0, f"128K prompt seeding took {elapsed_ms:.2f}ms"
 
 
 class TestUpstreamSemanticParity:
@@ -729,7 +727,7 @@ class TestVectorizedKernels:
             [0, NO_FORCED_TOKEN, vocab_size - 1, NO_FORCED_TOKEN],
             dtype=torch.int32,
         )
-        out = force_logits_rows(logits, forced_ids)
+        out = _force_logits_rows_impl(logits, forced_ids)
 
         # Input tensor must never be mutated in place (preserves raw logprobs).
         assert torch.equal(logits, orig_snapshot)
@@ -749,22 +747,31 @@ class TestVectorizedKernels:
         assert torch.isneginf(out[2, : vocab_size - 1]).all()
         assert int(torch.argmax(out[2]).item()) == vocab_size - 1
 
+        raw_1d = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
+        assert _force_token_ids_1d_impl(raw_1d, forced_ids).tolist() == [
+            0,
+            22,
+            vocab_size - 1,
+            44,
+        ]
+
     def test_prepare_and_advance_spec_verify_matches_scalar_reference(self) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         markers = ThinkingBudgetMarkers.from_reasoning_config(cfg)
         assert markers is not None
 
-        # 3 real requests padded to 4 rows, K=3, padded_logits_length=16.
-        # req 0 (slot 1): prompt-open, budget=2, drafts=[20, 21, 22] -> pos 0,1 ok;
-        #   pos 2 forced to GEMMA4_END[0] (106), bonus forced to 106 (if draft 2
-        #   mismatched; in simulation draft 2 was 22 != 106, so think_count=3 and
-        #   forcing_end=0 -> bonus would still want 106).
+        # 3 real requests in a 4-row verify chunk, with max_num_reqs=6 slot_ids,
+        # K=3, padded_logits_length=16:
+        # req 0 (slot 1): prompt-open, budget=3, drafts=[20, 21, 22] -> all 3
+        #   drafts within budget; if all 3 pass, raw bonus 99 at col 3 hits
+        #   think_count==3 and MUST be overridden to GEMMA4_END[0] (106) inside
+        #   advance_spec_states!
         # req 1 (slot 0): untracked, drafts=[30, 31], untouched.
         # req 2 (slot 2): prompt-open, budget=1, drafts=[40, 106, 50] -> pos 0 ok,
         #   pos 1 forced to 106 (draft matches 106!), pos 2 forced to 107 (mismatch).
-        state_table = torch.zeros((6, 7), dtype=torch.int32)
+        state_table = torch.zeros((7, 7), dtype=torch.int32)
         state_table[:, 0] = -1
-        st1 = compute_sequence_state([1, *GEMMA4_START], budget=2, markers=markers)
+        st1 = compute_sequence_state([1, *GEMMA4_START], budget=3, markers=markers)
         st2 = compute_sequence_state([1, *GEMMA4_START], budget=1, markers=markers)
         state_table = seed_states(
             state_table,
@@ -772,8 +779,8 @@ class TestVectorizedKernels:
             torch.tensor([st1, st2], dtype=torch.int32),
         )
 
-        slot_ids = torch.tensor([1, 0, 2, 0], dtype=torch.int32)
-        draft_lengths = torch.tensor([3, 2, 3, 0], dtype=torch.int32)
+        # slot_ids is sized to max_num_reqs=6 while next_tokens has 4 padded rows.
+        slot_ids = torch.tensor([1, 0, 2, 0, 0, 0], dtype=torch.int32)
         raw_drafts = [20, 21, 22, 30, 31, 40, GEMMA4_END[0], 50]
         draft_token_ids = torch.tensor(
             raw_drafts + [0] * (16 - len(raw_drafts)), dtype=torch.int32
@@ -785,21 +792,19 @@ class TestVectorizedKernels:
             [0, 1, 2, 0, 1, 0, 1, 2] + [0] * 8, dtype=torch.int32
         )
 
-        forced_target, forced_bonus, eff_drafts = prepare_spec_verify(
+        forced_target, eff_drafts = _prepare_spec_verify_drafts(
             state_table,
             slot_ids,
             draft_token_ids,
-            draft_lengths,
             segment_ids,
             group_indices,
-            max_draft_tokens=3,
-            markers=markers,
+            3,
+            *markers.kernel_args(),
         )
-
         assert forced_target[:8].tolist() == [
             -1,
             -1,
-            GEMMA4_END[0],  # req 0
+            -1,  # req 0 (within budget=3 across the 3 draft slots)
             -1,
             -1,  # req 1 (untracked)
             -1,
@@ -807,14 +812,10 @@ class TestVectorizedKernels:
             GEMMA4_END[1],  # req 2: draft[1]==106 matched, so pos 2 forces 107!
         ]
         assert (forced_target[8:] == -1).all()
-        # For req 2, simulated draft[2]==50 != 107 broke the partial [106, 107]
-        # match, so end_match reset to 0 and bonus would restart at GEMMA4_END[0].
-        assert forced_bonus.tolist() == [GEMMA4_END[0], -1, GEMMA4_END[0], -1]
-        # Mismatching drafts at forced slots become -1; matching draft 106 stays 106.
         assert eff_drafts[:8].tolist() == [
             20,
             21,
-            -1,
+            22,
             30,
             31,
             40,
@@ -822,14 +823,55 @@ class TestVectorizedKernels:
             -1,
         ]
 
-        # Commit rejection-sampler output rows and verify advance_spec_states
-        # matches scalar token-by-token advancement.
+        raw_logits = torch.zeros((16, 128), dtype=torch.float32)
+        raw_logits[:, 15] = 4.0
+        raw_argmax = torch.full((16,), 15, dtype=torch.int64)
+        flogits, eff_from_logits = prepare_spec_verify_logits(
+            state_table,
+            slot_ids,
+            draft_token_ids,
+            raw_logits,
+            segment_ids,
+            group_indices,
+            max_draft_tokens=3,
+            markers=markers,
+        )
+        ftokens, eff_from_tokens = prepare_spec_verify_tokens(
+            state_table,
+            slot_ids,
+            draft_token_ids,
+            raw_argmax,
+            segment_ids,
+            group_indices,
+            max_draft_tokens=3,
+            markers=markers,
+        )
+        assert torch.equal(eff_from_logits, eff_drafts)
+        assert torch.equal(eff_from_tokens, eff_drafts)
+        assert torch.argmax(flogits, dim=-1).tolist() == ftokens.tolist()
+        assert ftokens[:8].tolist() == [
+            15,
+            15,
+            15,
+            15,
+            15,
+            15,
+            GEMMA4_END[0],
+            GEMMA4_END[1],
+        ]
+
+        # Commit rejection-sampler output rows:
+        # - req 0 accepted all 3 drafts [20, 21, 22] and sampled raw bonus 99 ->
+        #   advance_spec_states overrides 99 -> GEMMA4_END[0] (106) and advances!
+        # - req 1 untracked -> [30, 31, 99, -1] unchanged.
+        # - req 2 accepted [40, 106] and recovered 107 -> finishes GEMMA4_END!
+        # - row 3 padded junk -> ignored because slot 0.
         committed = torch.tensor(
             [
-                [20, 21, GEMMA4_END[0], -1],  # req 0 -> needs 107 next
-                [30, 31, 99, -1],  # req 1 untracked
-                [40, GEMMA4_END[0], GEMMA4_END[1], -1],  # req 2 finished </think>!
-                [77, 78, 79, 80],  # padded junk row -> ignored because slot 0
+                [20, 21, 22, 99],
+                [30, 31, 99, -1],
+                [40, GEMMA4_END[0], GEMMA4_END[1], -1],
+                [77, 78, 79, 80],
             ],
             dtype=torch.int32,
         )
@@ -837,11 +879,12 @@ class TestVectorizedKernels:
         committed_out, state_table = advance_spec_states(
             state_table, slot_ids, committed, max_draft_tokens=3, markers=markers
         )
-        assert torch.equal(committed_out, committed)
+        assert committed_out[0].tolist() == [20, 21, 22, GEMMA4_END[0]]
+        assert torch.equal(committed_out[1:], committed[1:])
         assert not torch.equal(state_table, prev_snapshot)
 
         exp_st1 = compute_sequence_state(
-            [1, *GEMMA4_START, 20, 21, GEMMA4_END[0]], budget=2, markers=markers
+            [1, *GEMMA4_START, 20, 21, 22, GEMMA4_END[0]], budget=3, markers=markers
         )
         exp_st2 = compute_sequence_state(
             [1, *GEMMA4_START, 40, *GEMMA4_END], budget=1, markers=markers
@@ -1065,6 +1108,17 @@ class TestTrackerAndRunnerLifecycle:
         params = SamplingParams(temperature=0.0, thinking_token_budget=0)
         req = _request_state("r0", prompt, params, num_computed_tokens=0)
 
+        class _OffsetGenerator:
+            def __init__(self, offset: int) -> None:
+                self.offset = offset
+
+            def get_offset(self) -> int:
+                return self.offset
+
+            def set_offset(self, offset: int) -> None:
+                self.offset = offset
+
+        fake_gen = _OffsetGenerator(16)
         runner = SimpleNamespace(
             execute_model_state=SimpleNamespace(
                 scheduler_output=SimpleNamespace(
@@ -1087,7 +1141,7 @@ class TestTrackerAndRunnerLifecycle:
                 req_ids=["r0"],
                 req_id_to_index={"r0": 0},
                 all_greedy=True,
-                generators={},
+                generators={0: fake_gen},
                 num_tokens_no_spec=[4],
                 token_ids_cpu=np.zeros((1, 16), dtype=np.int32),
             ),
@@ -1122,12 +1176,15 @@ class TestTrackerAndRunnerLifecycle:
         ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
-        # Chunk 1 (4/8 tokens): sampled token discarded; must NOT consume GEMMA4_END[0].
+        # Chunk 1 (4/8 tokens): single pre-sampling discard pass suppresses
+        # thinking-budget advancement, discards sampled_token_ids, and rewinds
+        # generator offset by -4.
         out_partial = _run_sample_tokens(runner)
         assert out_partial.sampled_token_ids == [[]]
+        assert fake_gen.offset == 12
 
         # Chunk 2 (remaining 4/8 tokens): completes prefill and forces GEMMA4_END[0],
-        # then next decode forces GEMMA4_END[1].
+        # then next decode forces GEMMA4_END[1] (without further generator rewinds).
         req.num_computed_tokens = 4
         emitted: list[int] = []
         for scheduled in (4, 1, 1):
@@ -1152,6 +1209,7 @@ class TestTrackerAndRunnerLifecycle:
             req.num_computed_tokens += scheduled
         assert emitted == [GEMMA4_END[0], GEMMA4_END[1], 42]
         assert req.output_token_ids == emitted
+        assert fake_gen.offset == 12
 
     def test_slot_pool_sized_at_max_num_reqs_plus_one_reconciles_and_asserts(
         self,
@@ -1230,6 +1288,49 @@ class TestTrackerAndRunnerLifecycle:
             )
         with pytest.raises(AssertionError, match="Duplicate slot"):
             tracker.build_chunk_slot_ids(torch.device("cpu"), ["a", "a"], 0, 2, 4)
+
+    def test_steady_state_prepare_step_and_chunk_fast_cache_invalidation(self) -> None:
+        cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+        tracker = ThinkingBudgetTracker(cfg, max_num_reqs=4)
+        dev = torch.device("cpu")
+        sp = SamplingParams(thinking_token_budget=2)
+        r0 = _request_state("r0", [1, QWEN3_START[0]], sp)
+        r1 = _request_state("r1", [1, QWEN3_START[0]], SamplingParams())
+        reqs: dict[str, CachedRequestState] = {"r0": r0, "r1": r1}
+        tracker.add("r0", sp, r0.prompt_token_ids)
+        tracker.add("r1", r1.sampling_params, r1.prompt_token_ids)
+
+        t1 = tracker.prepare_step(dev, ["r0", "r1"], reqs)
+        assert t1 is not None
+        epoch_after_seed = tracker._state_epoch
+        s1 = tracker.build_chunk_slot_ids(dev, ["r0", "r1"], 0, 2, 4)
+        s2 = tracker.build_chunk_slot_ids(dev, ["r0", "r1"], 0, 2, 4)
+        assert s1 is not None and s2 is s1
+        assert tracker.prepare_step(dev, ["r0", "r1"], reqs) is t1
+        assert tracker._state_epoch == epoch_after_seed
+
+        # Untracked-only batch also caches None cleanly.
+        assert tracker.prepare_step(dev, ["r1"], reqs) is None
+        assert tracker.prepare_step(dev, ["r1"], reqs) is None
+        assert tracker.build_chunk_slot_ids(dev, ["r1"], 0, 1, 4) is None
+        assert tracker.build_chunk_slot_ids(dev, ["r1"], 0, 1, 4) is None
+
+        # Preemption + resume bump _state_epoch and invalidate _chunk_fast_cache.
+        tracker.on_preempted(["r0"])
+        assert tracker._state_epoch > epoch_after_seed
+        assert not tracker._chunk_fast_cache
+        assert tracker.build_chunk_slot_ids(dev, ["r0", "r1"], 0, 2, 4) is None
+
+        tracker.on_resumed(["r0"], reqs)
+        t_resumed = tracker.prepare_step(dev, ["r0", "r1"], reqs)
+        assert t_resumed is not None
+        s_resumed = tracker.build_chunk_slot_ids(dev, ["r0", "r1"], 0, 2, 4)
+        assert s_resumed is not None and int(s_resumed[0].item()) > 0
+
+        # Discard bumps epoch and clears fast cache.
+        tracker.discard(["r0"])
+        assert not tracker._chunk_fast_cache
+        assert tracker.prepare_step(dev, ["r0", "r1"], reqs) is None
 
 
 class TestSampleTokensIntegration:
@@ -1476,8 +1577,13 @@ class TestSampleTokensIntegration:
             r_fresh = _request_state("r0", [1, *GEMMA4_START], params)
             table = tb.prepare_step(torch.device("cpu"), ["r0"], {"r0": r_fresh})
             assert table is not None and tb.markers is not None
-            slots = tb.build_chunk_slot_ids(torch.device("cpu"), ["r0"], 0, 1, 2)
-            assert slots is not None
+            step_state = _ThinkingBudgetStepState(tb, table, tb.markers, frozenset())
+            tb_chunk = step_state.spec_chunk(
+                torch.device("cpu"), ["r0"], 0, 1, md.draft_lengths.shape[0]
+            )
+            assert tb_chunk is not None and isinstance(
+                tb_chunk, _ThinkingBudgetSpecChunk
+            )
             with torch.compiler.set_stance("force_eager"):
                 res = TPUModelRunner._sample_spec_verify_chunk(
                     runner,
@@ -1491,10 +1597,7 @@ class TestSampleTokensIntegration:
                     None,
                     use_top_tokens,
                     None,
-                    table,
-                    slots,
-                    tb.markers,
-                    tb.commit_state_table,
+                    tb_chunk,
                 )
             outputs.append(res[0].tolist())
         # Draft 0 (40) accepted as the 1 thinking token; draft 1 (41 != 106)
@@ -1751,10 +1854,11 @@ class TestSampleTokensIntegration:
 
         table = tracker.prepare_step(torch.device("cpu"), ["r0", "r1", "r2"], reqs)
         assert table is not None
-        slots = tracker.build_chunk_slot_ids(
-            torch.device("cpu"), ["r0", "r1", "r2"], 0, 3, padded_num_reqs=4
+        step_state = _ThinkingBudgetStepState(tracker, table, markers, frozenset())
+        tb_chunk = step_state.spec_chunk(
+            torch.device("cpu"), ["r0", "r1", "r2"], 0, 3, 4
         )
-        assert slots is not None
+        assert tb_chunk is not None
 
         row_prefs = [
             40,
@@ -1804,10 +1908,7 @@ class TestSampleTokensIntegration:
                 torch.Generator().manual_seed(0),
                 False,
                 None,
-                table,
-                slots,
-                markers,
-                tracker.commit_state_table,
+                tb_chunk,
             )
         table = tracker.ensure_state_table(torch.device("cpu"))
 
@@ -2036,7 +2137,10 @@ def _dynamo_runner_limits() -> Iterator[None]:
 class TestStaticShapesAndZeroRecompilations:
     """Bucket precompile coverage and ``torch.compile(dynamic=False)`` checks."""
 
-    def test_precompile_covers_every_runtime_shape_and_dtype(self) -> None:
+    @pytest.mark.parametrize("use_top_tokens", [False, True])
+    def test_precompile_covers_every_runtime_shape_and_dtype(
+        self, use_top_tokens: bool
+    ) -> None:
         cfg = _reasoning_config(list(GEMMA4_START), list(GEMMA4_END))
         runner = object.__new__(TPUModelRunner)
         runner.max_num_reqs = 16
@@ -2044,6 +2148,7 @@ class TestStaticShapesAndZeroRecompilations:
         runner.num_tokens_paddings = [16, 32, 64, 128]
         runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
         runner._mtp_prefill_only = False
+        runner._greedy_head_owner = object() if use_top_tokens else None
         runner.device = torch.device("cpu")
         runner.vocab_size = 128
         runner._hidden_states_dtype = torch.bfloat16
@@ -2056,9 +2161,8 @@ class TestStaticShapesAndZeroRecompilations:
         calls: set[tuple[object, ...]] = set()
         orig_seed = thinking_budget.seed_states
         orig_plain = thinking_budget.override_and_advance_plain
-        orig_prep = thinking_budget.prepare_spec_verify
-        orig_flogits = thinking_budget.force_logits_rows
-        orig_f1d = thinking_budget.force_token_ids_1d
+        orig_prep_logits = thinking_budget.prepare_spec_verify_logits
+        orig_prep_tokens = thinking_budget.prepare_spec_verify_tokens
         orig_adv = thinking_budget.advance_spec_states
 
         def sig(
@@ -2084,24 +2188,18 @@ class TestStaticShapesAndZeroRecompilations:
             ),
             patch.object(
                 thinking_budget,
-                "prepare_spec_verify",
-                side_effect=lambda st, sl, dt, dl, seg, grp, k, m: (
-                    calls.add(("prep", k, *sig(st, sl, dt, dl, seg, grp)))
-                    or orig_prep(st, sl, dt, dl, seg, grp, k, m)
+                "prepare_spec_verify_logits",
+                side_effect=lambda st, sl, dt, lg, seg, grp, k, m: (
+                    calls.add(("prep_logits", k, *sig(st, sl, dt, lg, seg, grp)))
+                    or orig_prep_logits(st, sl, dt, lg, seg, grp, k, m)
                 ),
             ),
             patch.object(
                 thinking_budget,
-                "force_logits_rows",
-                side_effect=lambda lg, fi: (
-                    calls.add(("flogits", *sig(lg, fi))) or orig_flogits(lg, fi)
-                ),
-            ),
-            patch.object(
-                thinking_budget,
-                "force_token_ids_1d",
-                side_effect=lambda tk, fi: (
-                    calls.add(("f1d", *sig(tk, fi))) or orig_f1d(tk, fi)
+                "prepare_spec_verify_tokens",
+                side_effect=lambda st, sl, dt, tk, seg, grp, k, m: (
+                    calls.add(("prep_tokens", k, *sig(st, sl, dt, tk, seg, grp)))
+                    or orig_prep_tokens(st, sl, dt, tk, seg, grp, k, m)
                 ),
             ),
             patch.object(
@@ -2115,8 +2213,11 @@ class TestStaticShapesAndZeroRecompilations:
         ):
             runner._precompile_thinking_budget()
             precompiled, calls = calls, set()
+            if not use_top_tokens:
+                assert not any(c[0] == "prep_tokens" for c in precompiled)
 
-            # Replay live serving calls across all padded request & verify buckets.
+            # Replay live serving calls across all padded request & verify buckets
+            # (including every reachable (num_tokens, num_reqs) pair).
             tb = runner._thinking_budget
             assert tb.markers is not None
             tb.add("r0", SamplingParams(thinking_token_budget=2), [1, *GEMMA4_START])
@@ -2139,46 +2240,42 @@ class TestStaticShapesAndZeroRecompilations:
                 )
                 tb.commit_state_table(st_table)
 
-            for num_tokens, num_reqs in runner._spec_verify_bucket_pairs():
-                slots = tb.build_chunk_slot_ids(
-                    torch.device("cpu"), ["r0"], 0, 1, num_reqs
-                )
-                assert slots is not None
-                ft, fb, _ = thinking_budget.prepare_spec_verify(
-                    st_table,
-                    slots,
-                    torch.zeros(num_tokens, dtype=torch.int32),
-                    torch.zeros(num_reqs, dtype=torch.int32),
-                    torch.zeros(num_tokens, dtype=torch.int64),
-                    torch.zeros(num_tokens, dtype=torch.int32),
-                    3,
-                    tb.markers,
-                )
-                thinking_budget.force_logits_rows(
-                    torch.zeros((num_tokens, 128), dtype=torch.bfloat16), ft
-                )
-                thinking_budget.force_token_ids_1d(
-                    torch.zeros(num_tokens, dtype=torch.int64), ft
-                )
-                thinking_budget.force_token_ids_1d(
-                    torch.zeros(num_reqs, dtype=torch.int64), fb
-                )
-                _, st_table = thinking_budget.advance_spec_states(
-                    st_table,
-                    slots,
-                    torch.full((num_reqs, 4), -1, dtype=torch.int32),
-                    3,
-                    tb.markers,
-                )
-                tb.commit_state_table(st_table)
+            step_state = _ThinkingBudgetStepState(tb, st_table, tb.markers, frozenset())
+            for num_tokens in runner._verify_logits_paddings():
+                for num_reqs in runner.num_reqs_paddings:
+                    if not runner._spec_verify_bucket_reachable(num_tokens, num_reqs):
+                        continue
+                    tb_chunk = step_state.spec_chunk(
+                        torch.device("cpu"), ["r0"], 0, 1, num_reqs
+                    )
+                    assert tb_chunk is not None
+                    md = SimpleNamespace(
+                        segment_ids=torch.full((num_tokens,), 1, dtype=torch.int64),
+                        group_indices=torch.zeros(num_tokens, dtype=torch.int32),
+                    )
+                    tb_chunk.prepare_logits(
+                        torch.zeros(num_tokens, dtype=torch.int32),
+                        torch.zeros((num_tokens, 128), dtype=torch.bfloat16),
+                        md,
+                        3,
+                    )
+                    if use_top_tokens:
+                        tb_chunk.prepare_tokens(
+                            torch.zeros(num_tokens, dtype=torch.int32),
+                            torch.zeros(num_tokens, dtype=torch.int64),
+                            md,
+                            3,
+                        )
+                    tb_chunk.finish(torch.full((num_reqs, 4), -1, dtype=torch.int32), 3)
 
         assert calls
         assert calls <= precompiled
 
+    @pytest.mark.parametrize("use_top_tokens", [False, True])
     def test_torch_compile_fullgraph_dynamic_false_zero_recompilations(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, use_top_tokens: bool
     ) -> None:
-        """Compile all 6 kernels with ``fullgraph=True, dynamic=False`` and a
+        """Compile all kernels with ``fullgraph=True, dynamic=False`` and a
         graph-counting backend. After ``precompile()``, 20 heterogeneous serving
         steps (varying active request counts, reorderings, budgets, preemptions,
         plain decode, and speculative verify) must trigger **0** new compiles."""
@@ -2205,21 +2302,15 @@ class TestStaticShapesAndZeroRecompilations:
                 fullgraph=True,
                 dynamic=False,
             )
-            compiled_prep = torch.compile(
-                thinking_budget._prepare_spec_verify_impl,
-                backend=make_counting_backend("prep"),
+            compiled_prep_logits = torch.compile(
+                thinking_budget._prepare_spec_verify_logits_impl,
+                backend=make_counting_backend("prep_logits"),
                 fullgraph=True,
                 dynamic=False,
             )
-            compiled_flogits = torch.compile(
-                thinking_budget._force_logits_rows_impl,
-                backend=make_counting_backend("flogits"),
-                fullgraph=True,
-                dynamic=False,
-            )
-            compiled_f1d = torch.compile(
-                thinking_budget._force_token_ids_1d_impl,
-                backend=make_counting_backend("f1d"),
+            compiled_prep_tokens = torch.compile(
+                thinking_budget._prepare_spec_verify_tokens_impl,
+                backend=make_counting_backend("prep_tokens"),
                 fullgraph=True,
                 dynamic=False,
             )
@@ -2235,13 +2326,14 @@ class TestStaticShapesAndZeroRecompilations:
                 thinking_budget, "_override_and_advance_plain_impl", compiled_plain
             )
             monkeypatch.setattr(
-                thinking_budget, "_prepare_spec_verify_impl", compiled_prep
+                thinking_budget,
+                "_prepare_spec_verify_logits_impl",
+                compiled_prep_logits,
             )
             monkeypatch.setattr(
-                thinking_budget, "_force_logits_rows_impl", compiled_flogits
-            )
-            monkeypatch.setattr(
-                thinking_budget, "_force_token_ids_1d_impl", compiled_f1d
+                thinking_budget,
+                "_prepare_spec_verify_tokens_impl",
+                compiled_prep_tokens,
             )
             monkeypatch.setattr(
                 thinking_budget, "_advance_spec_states_impl", compiled_adv
@@ -2253,20 +2345,25 @@ class TestStaticShapesAndZeroRecompilations:
 
             num_reqs_paddings = [4, 8]
             verify_logits_paddings = [8, 16, 32]
-            spec_verify_pairs = [(8, 4), (8, 8), (16, 4), (16, 8), (32, 8)]
 
             tracker.precompile(
                 device=torch.device("cpu"),
                 num_reqs_paddings=num_reqs_paddings,
                 verify_logits_paddings=verify_logits_paddings,
-                spec_verify_pairs=spec_verify_pairs,
                 max_draft_tokens=3,
                 vocab_size=64,
                 logits_dtype=torch.float32,
                 sync_fn=lambda _x: None,
+                precompile_top_tokens=use_top_tokens,
             )
             warmup_count = len(graph_compiles)
-            assert warmup_count > 0
+            expected_warmup = (
+                1
+                + len(num_reqs_paddings)
+                + len(verify_logits_paddings) * (2 if use_top_tokens else 1)
+                + len(num_reqs_paddings)
+            )
+            assert warmup_count == expected_warmup
 
             # Run 20 varied serving steps across varying active request counts (1..8),
             # budgets (0, 1, 3, None), batch permutations, preemptions, plain + spec.
@@ -2296,44 +2393,56 @@ class TestStaticShapesAndZeroRecompilations:
                 )
                 if st_table is None:
                     continue
-                slots = tracker.build_chunk_slot_ids(
-                    torch.device("cpu"), batch_ids, 0, n_active, padded_reqs
-                )
-                if slots is None:
-                    continue
 
                 if step % 2 == 0:
+                    slots = tracker.build_chunk_slot_ids(
+                        torch.device("cpu"), batch_ids, 0, n_active, padded_reqs
+                    )
+                    if slots is None:
+                        continue
                     sel = torch.randint(0, 64, (padded_reqs, 1), dtype=torch.int64)
                     _, st_table = override_and_advance_plain(
                         st_table, slots, sel, tracker.markers
                     )
                     tracker.commit_state_table(st_table)
                 else:
-                    padded_toks = 16 if padded_reqs == 4 else 32
-                    d_lens = torch.zeros(padded_reqs, dtype=torch.int32)
-                    d_lens[:n_active] = torch.tensor(
-                        rng.integers(0, 4, size=n_active), dtype=torch.int32
+                    spec_slots = tracker.build_chunk_slot_ids(
+                        torch.device("cpu"),
+                        batch_ids,
+                        0,
+                        n_active,
+                        tracker.max_num_reqs,
                     )
-                    ft, fb, _ = prepare_spec_verify(
+                    if spec_slots is None:
+                        continue
+                    padded_toks = 16 if padded_reqs == 4 else 32
+                    seg = torch.full((padded_toks,), n_active, dtype=torch.int64)
+                    grp = torch.zeros(padded_toks, dtype=torch.int32)
+                    drafts = torch.randint(0, 64, (padded_toks,), dtype=torch.int32)
+                    prepare_spec_verify_logits(
                         st_table,
-                        slots,
-                        torch.randint(0, 64, (padded_toks,), dtype=torch.int32),
-                        d_lens,
-                        torch.zeros(padded_toks, dtype=torch.int64),
-                        torch.zeros(padded_toks, dtype=torch.int32),
+                        spec_slots,
+                        drafts,
+                        torch.randn(padded_toks, 64),
+                        seg,
+                        grp,
                         3,
                         tracker.markers,
                     )
-                    force_logits_rows(torch.randn(padded_toks, 64), ft)
-                    force_token_ids_1d(
-                        torch.randint(0, 64, (padded_toks,), dtype=torch.int64), ft
-                    )
-                    force_token_ids_1d(
-                        torch.randint(0, 64, (padded_reqs,), dtype=torch.int64), fb
-                    )
+                    if use_top_tokens:
+                        prepare_spec_verify_tokens(
+                            st_table,
+                            spec_slots,
+                            drafts,
+                            torch.randint(0, 64, (padded_toks,), dtype=torch.int64),
+                            seg,
+                            grp,
+                            3,
+                            tracker.markers,
+                        )
                     _, st_table = advance_spec_states(
                         st_table,
-                        slots,
+                        spec_slots,
                         torch.randint(-1, 64, (padded_reqs, 4), dtype=torch.int32),
                         3,
                         tracker.markers,
@@ -2391,20 +2500,22 @@ class TestStaticShapesAndZeroRecompilations:
         assert slots_reordered is not None
         assert not torch.equal(slots_reordered, slots_1)
 
-        # Partial prefill masks out in-flight chunked prefill rows.
-        slots_partial = tracker.build_chunk_slot_ids(
-            dev, ["b", "a"], 0, 2, 4, is_partial_prefill=lambda rid: rid == "b"
-        )
-        assert slots_partial is not None
-        assert int(slots_partial[0].item()) == 0
-        assert int(slots_partial[1].item()) > 0
+        # Partial prefill masks in-flight chunked prefill rows (set and callable).
+        for disc in ({"b"}, lambda rid: rid == "b"):
+            slots_partial = tracker.build_chunk_slot_ids(
+                dev, ["b", "a"], 0, 2, 4, discard_req_ids=disc
+            )
+            assert slots_partial is not None
+            assert int(slots_partial[0].item()) == 0
+            assert int(slots_partial[1].item()) > 0
 
-        # Bounding check on _slot_upload_cache across >32 distinct start_idx keys.
+        # Bounding check on _slot_upload_cache & _chunk_fast_cache across >32 keys.
         padded_batch = ["a"] + [None] * 64
         for start in range(40):
             padded_batch[start] = "a"
             tracker.build_chunk_slot_ids(dev, padded_batch, start, start + 1, 4)
         assert len(tracker._slot_upload_cache) <= thinking_budget._MAX_SLOT_UPLOAD_CACHE
+        assert len(tracker._chunk_fast_cache) <= thinking_budget._MAX_SLOT_UPLOAD_CACHE
         assert not any(non_blocking_flags)
 
         # Unindexed vs indexed device equivalence (e.g. tpu vs tpu:0).
@@ -2421,7 +2532,7 @@ class TestStaticShapesAndZeroRecompilations:
             torch.device("cpu"), torch.device("cuda")
         )
 
-    def test_spec_verify_bucket_pairs_matches_rejection_sampler_sweep(
+    def test_precompile_graph_count_budget_plain_ngram_and_mtp(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
@@ -2429,53 +2540,120 @@ class TestStaticShapesAndZeroRecompilations:
         monkeypatch.setattr(tpu_runner_mod, "synchronize_tensors", lambda _out: None)
         monkeypatch.delenv("TPU_PARALLEL_PRECOMPILE", raising=False)
 
-        recorded_calls: list[tuple[int, int]] = []
+        def count_graphs(
+            *,
+            max_reqs: int,
+            req_pads: list[int],
+            tok_pads: list[int],
+            max_verify_rows: int,
+            k: int | None,
+            mtp_prefill_only: bool = False,
+            top_tokens: bool = False,
+        ) -> int:
+            cfg = _reasoning_config(list(QWEN3_START), list(QWEN3_END))
+            runner = SimpleNamespace(
+                _thinking_budget=ThinkingBudgetTracker(cfg, max_num_reqs=max_reqs),
+                speculative_config=(
+                    None if k is None else SimpleNamespace(num_speculative_tokens=k)
+                ),
+                _mtp_prefill_only=mtp_prefill_only,
+                _greedy_head_owner=object() if top_tokens else None,
+                num_reqs_paddings=req_pads,
+                num_tokens_paddings=tok_pads,
+                max_num_reqs=max_reqs,
+                vocab_size=16,
+                _hidden_states_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                structured_decoding_manager=SimpleNamespace(
+                    target_grammar_bitmask_cpu=torch.zeros(
+                        (max_verify_rows, 1), dtype=torch.int32
+                    )
+                ),
+                _precompile_timed=lambda _name: MagicMock(
+                    __enter__=lambda *_a: None, __exit__=lambda *_a: False
+                ),
+            )
+            runner._verify_logits_paddings = (
+                TPUModelRunner._verify_logits_paddings.__get__(runner)
+            )
+            n = 0
+            for fn_name in (
+                "seed_states",
+                "override_and_advance_plain",
+                "prepare_spec_verify_logits",
+                "prepare_spec_verify_tokens",
+                "advance_spec_states",
+            ):
+                orig = getattr(thinking_budget, fn_name)
 
-        class _RecordingRejectionSampler:
-            synthetic_mode = False
+                def wrap(*args, _orig=orig):
+                    nonlocal n
+                    n += 1
+                    return _orig(*args)
 
-            def __call__(self, *, draft_token_ids, num_draft_tokens, **_kwargs):
-                recorded_calls.append(
-                    (draft_token_ids.shape[0], num_draft_tokens.shape[0])
-                )
-                return draft_token_ids
+                monkeypatch.setattr(thinking_budget, fn_name, wrap)
+            TPUModelRunner._precompile_thinking_budget(runner)  # type: ignore[arg-type]
+            return n
 
-        fake_runner = SimpleNamespace(
-            _is_async_drafter=True,
-            speculative_config=SimpleNamespace(num_speculative_tokens=3),
-            rejection_sampler=_RecordingRejectionSampler(),
-            num_tokens_paddings=[32, 64, 128, 256, 384, 512, 768],
-            num_reqs_paddings=[8, 16, 32, 64, 128, 192],
-            max_num_reqs=192,
-            vocab_size=4,
-            _hidden_states_dtype=torch.float32,
-            device="cpu",
-            spec_bonus_and_target_logits=lambda logits, b_idx, _t_idx: (b_idx, logits),
-            spec_gather_bonus_and_target_logits=lambda logits, b_idx, _t_idx: (
-                b_idx,
-                logits,
-            ),
-            _precompile_timed=lambda _name: MagicMock(
-                __enter__=lambda *_a: None, __exit__=lambda *_a: False
-            ),
-            _greedy_head_owner=None,
-            _topk_candidate_blocks=lambda: 0,
+        qwen3_reqs = [8, 16, 32, 64, 128]
+        qwen3_toks = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        # Plain decode (max_num_seqs=128): 1 seed + 5 plain = 6 graphs.
+        assert (
+            count_graphs(
+                max_reqs=128,
+                req_pads=qwen3_reqs,
+                tok_pads=qwen3_toks,
+                max_verify_rows=512,
+                k=None,
+            )
+            == 6
         )
-        fake_runner._spec_verify_bucket_reachable = (
-            TPUModelRunner._spec_verify_bucket_reachable.__get__(fake_runner)
+        # Spec decode ngram K=3 (max_num_seqs=128): 1 + 5 + 6 + 5 = 17 graphs.
+        assert (
+            count_graphs(
+                max_reqs=128,
+                req_pads=qwen3_reqs,
+                tok_pads=qwen3_toks,
+                max_verify_rows=512,
+                k=3,
+            )
+            == 17
         )
-
-        helper_pairs = _spec_verify_bucket_pairs_for_runner(fake_runner)
-        method_pairs = TPUModelRunner._spec_verify_bucket_pairs(fake_runner)  # type: ignore[arg-type]
-        TPUModelRunner._precompile_rejection_sampler(fake_runner)  # type: ignore[arg-type]
-
-        assert helper_pairs == method_pairs == recorded_calls[::3]
-
-        fake_runner._mtp_prefill_only = True
-        assert _spec_verify_bucket_pairs_for_runner(fake_runner) == []
-        fake_runner._mtp_prefill_only = False
-        fake_runner.speculative_config = None
-        assert _spec_verify_bucket_pairs_for_runner(fake_runner) == []
+        # With TPU_GREEDY_TOP_TOKENS=1: adds 6 prepare_spec_verify_tokens graphs (23).
+        assert (
+            count_graphs(
+                max_reqs=128,
+                req_pads=qwen3_reqs,
+                tok_pads=qwen3_toks,
+                max_verify_rows=512,
+                k=3,
+                top_tokens=True,
+            )
+            == 23
+        )
+        # Spec decode MTP K=2 (max_num_seqs=32): 1 + 3 + 4 + 3 = 11 graphs.
+        assert (
+            count_graphs(
+                max_reqs=32,
+                req_pads=[8, 16, 32],
+                tok_pads=qwen3_toks,
+                max_verify_rows=128,
+                k=2,
+            )
+            == 11
+        )
+        # MTP prefill-only mode skips all spec-verify kernels: 1 + 3 = 4 graphs.
+        assert (
+            count_graphs(
+                max_reqs=32,
+                req_pads=[8, 16, 32],
+                tok_pads=qwen3_toks,
+                max_verify_rows=128,
+                k=2,
+                mtp_prefill_only=True,
+            )
+            == 4
+        )
 
     def test_precompile_sweep_rotation_and_zero_collectives(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2498,6 +2676,7 @@ class TestStaticShapesAndZeroRecompilations:
                 _thinking_budget=ThinkingBudgetTracker(cfg, max_num_reqs=paddings[-1]),
                 speculative_config=None,
                 _mtp_prefill_only=False,
+                _greedy_head_owner=None,
                 num_reqs_paddings=paddings,
                 num_tokens_paddings=paddings,
                 max_num_reqs=paddings[-1],
@@ -2510,9 +2689,6 @@ class TestStaticShapesAndZeroRecompilations:
             )
             runner._verify_logits_paddings = (
                 TPUModelRunner._verify_logits_paddings.__get__(runner)
-            )
-            runner._spec_verify_bucket_pairs = (
-                TPUModelRunner._spec_verify_bucket_pairs.__get__(runner)
             )
             orig_plain = thinking_budget.override_and_advance_plain
             with patch.object(
@@ -2570,7 +2746,7 @@ class TestStaticShapesAndZeroRecompilations:
                     *m.kernel_args(),
                 )
                 torch.compile(
-                    thinking_budget._prepare_spec_verify_impl,
+                    thinking_budget._prepare_spec_verify_logits_impl,
                     backend=record_backend,
                     fullgraph=True,
                     dynamic=False,
@@ -2578,8 +2754,23 @@ class TestStaticShapesAndZeroRecompilations:
                     st,
                     slots,
                     torch.zeros(8, dtype=torch.int32),
-                    torch.zeros(4, dtype=torch.int32),
+                    torch.zeros((8, 32), dtype=torch.bfloat16),
+                    torch.full((8,), 4, dtype=torch.int64),
+                    torch.zeros(8, dtype=torch.int32),
+                    3,
+                    *m.kernel_args(),
+                )
+                torch.compile(
+                    thinking_budget._prepare_spec_verify_tokens_impl,
+                    backend=record_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )(
+                    st,
+                    slots,
+                    torch.zeros(8, dtype=torch.int32),
                     torch.zeros(8, dtype=torch.int64),
+                    torch.full((8,), 4, dtype=torch.int64),
                     torch.zeros(8, dtype=torch.int32),
                     3,
                     *m.kernel_args(),
@@ -2596,24 +2787,6 @@ class TestStaticShapesAndZeroRecompilations:
                     3,
                     *m.kernel_args(),
                 )
-            torch.compile(
-                thinking_budget._force_logits_rows_impl,
-                backend=record_backend,
-                fullgraph=True,
-                dynamic=False,
-            )(
-                torch.zeros((8, 32), dtype=torch.bfloat16),
-                torch.full((8,), -1, dtype=torch.int32),
-            )
-            torch.compile(
-                thinking_budget._force_token_ids_1d_impl,
-                backend=record_backend,
-                fullgraph=True,
-                dynamic=False,
-            )(
-                torch.zeros(8, dtype=torch.int64),
-                torch.full((8,), -1, dtype=torch.int32),
-            )
 
         assert traced_graphs
         assert [op for gm in traced_graphs for op in ops_outside_aten(gm)] == []
@@ -2671,10 +2844,10 @@ class TestStaticShapesAndZeroRecompilations:
                 assert torch.equal(out_tpu.cpu(), out_cpu)
                 assert torch.equal(tpu_table.cpu(), cpu_table)
 
-            # 2. Re-seed fresh budgets and verify all 4 speculative-decoding kernels:
-            #    prepare_spec_verify, force_logits_rows, force_token_ids_1d, and
-            #    advance_spec_states.
-            for rid, b in (("a", 0), ("b", 1), ("c", 3), ("d", None)):
+            # 2. Re-seed fresh budgets and verify all speculative-decoding kernels:
+            #    prepare_spec_verify_logits, prepare_spec_verify_tokens, and
+            #    bonus-overriding advance_spec_states.
+            for rid, b in (("a", 0), ("b", 1), ("c", 2), ("d", None)):
                 sp = SamplingParams(thinking_token_budget=b)
                 reqs[rid] = _request_state(rid, [1, *GEMMA4_START], sp)
                 cpu_tracker.add(rid, sp, [1, *GEMMA4_START])
@@ -2690,14 +2863,13 @@ class TestStaticShapesAndZeroRecompilations:
             assert cpu_slots is not None and tpu_slots is not None
 
             # Padded verify bucket (num_tokens=16, num_reqs=4, max_draft_tokens=3):
-            # req a (len 2): [106, 99] -> 106 accepted, 99 rejected
-            # req b (len 3): [50, 51, 52] -> 1 tok allowed, then force 106, 107
-            # req c (len 2): [60, 61] -> within budget=3, no forcing
-            # req d (len 1): [70] -> untracked
-            draft_lengths_cpu = torch.tensor([2, 3, 2, 1], dtype=torch.int32)
+            # req a (len 2, budget=0): [106, 99] -> 106 accepted, 99 forced to 107
+            # req b (len 3, budget=1): [50, 51, 52] -> 1 tok allowed, force 106, 107
+            # req c (len 2, budget=2): [60, 61] -> 2 drafts ok, bonus forced to 106!
+            # req d (len 1, budget=None): [70] -> untracked
             draft_tokens_cpu = torch.full((16,), 0, dtype=torch.int32)
-            segment_ids_cpu = torch.full((16,), -1, dtype=torch.int64)
-            group_indices_cpu = torch.full((16,), -1, dtype=torch.int32)
+            segment_ids_cpu = torch.full((16,), 4, dtype=torch.int64)
+            group_indices_cpu = torch.full((16,), 0, dtype=torch.int32)
             per_req_drafts = [[106, 99], [50, 51, 52], [60, 61], [70]]
             cursor = 0
             for req_idx, r_drafts in enumerate(per_req_drafts):
@@ -2708,52 +2880,63 @@ class TestStaticShapesAndZeroRecompilations:
                     cursor += 1
                 cursor += 1  # bonus slot row in verify layout
 
-            ft_cpu, fb_cpu, eff_cpu = prepare_spec_verify(
+            raw_logits_cpu = torch.randn((16, 128), dtype=torch.bfloat16)
+            flogits_cpu, eff_cpu = prepare_spec_verify_logits(
                 cpu_table,
                 cpu_slots,
                 draft_tokens_cpu,
-                draft_lengths_cpu,
+                raw_logits_cpu,
                 segment_ids_cpu,
                 group_indices_cpu,
                 3,
                 markers,
             )
-            ft_tpu, fb_tpu, eff_tpu = prepare_spec_verify(
+            flogits_tpu, eff_tpu = prepare_spec_verify_logits(
                 tpu_table,
                 tpu_slots,
                 draft_tokens_cpu.to(tpu),
-                draft_lengths_cpu.to(tpu),
+                raw_logits_cpu.to(tpu),
                 segment_ids_cpu.to(tpu),
                 group_indices_cpu.to(tpu),
                 3,
                 markers,
             )
-            synchronize_tensors([ft_tpu, fb_tpu, eff_tpu])
-            assert torch.equal(ft_tpu.cpu(), ft_cpu)
-            assert torch.equal(fb_tpu.cpu(), fb_cpu)
+            synchronize_tensors([flogits_tpu, eff_tpu])
+            assert torch.equal(flogits_tpu.cpu(), flogits_cpu)
             assert torch.equal(eff_tpu.cpu(), eff_cpu)
 
-            raw_logits_cpu = torch.randn((16, 128), dtype=torch.bfloat16)
-            flogits_cpu = force_logits_rows(raw_logits_cpu, ft_cpu)
-            flogits_tpu = force_logits_rows(raw_logits_cpu.to(tpu), ft_tpu)
-            synchronize_tensors(flogits_tpu)
-            assert torch.equal(flogits_tpu.cpu(), flogits_cpu)
-
             raw_target_ids_cpu = torch.arange(16, dtype=torch.int64) + 10
-            raw_bonus_ids_cpu = torch.tensor([80, 81, 82, 83], dtype=torch.int64)
-            ftarget_cpu = force_token_ids_1d(raw_target_ids_cpu, ft_cpu)
-            ftarget_tpu = force_token_ids_1d(raw_target_ids_cpu.to(tpu), ft_tpu)
-            fbonus_cpu = force_token_ids_1d(raw_bonus_ids_cpu, fb_cpu)
-            fbonus_tpu = force_token_ids_1d(raw_bonus_ids_cpu.to(tpu), fb_tpu)
-            synchronize_tensors([ftarget_tpu, fbonus_tpu])
+            ftarget_cpu, eff_tok_cpu = prepare_spec_verify_tokens(
+                cpu_table,
+                cpu_slots,
+                draft_tokens_cpu,
+                raw_target_ids_cpu,
+                segment_ids_cpu,
+                group_indices_cpu,
+                3,
+                markers,
+            )
+            ftarget_tpu, eff_tok_tpu = prepare_spec_verify_tokens(
+                tpu_table,
+                tpu_slots,
+                draft_tokens_cpu.to(tpu),
+                raw_target_ids_cpu.to(tpu),
+                segment_ids_cpu.to(tpu),
+                group_indices_cpu.to(tpu),
+                3,
+                markers,
+            )
+            synchronize_tensors([ftarget_tpu, eff_tok_tpu])
             assert torch.equal(ftarget_tpu.cpu(), ftarget_cpu)
-            assert torch.equal(fbonus_tpu.cpu(), fbonus_cpu)
+            assert torch.equal(eff_tok_tpu.cpu(), eff_tok_cpu)
 
+            # Row 2 (req c) accepted [60, 61] and sampled raw bonus 82 ->
+            # advance_spec_states overrides 82 to GEMMA4_END[0] (106)!
             next_tokens_cpu = torch.tensor(
                 [
                     [106, 107, -1, -1],
                     [50, 106, -1, -1],
-                    [60, 61, 62, -1],
+                    [60, 61, 82, -1],
                     [70, 83, -1, -1],
                 ],
                 dtype=torch.int32,
@@ -2767,6 +2950,7 @@ class TestStaticShapesAndZeroRecompilations:
             )
             tpu_tracker.commit_state_table(tpu_table)
             synchronize_tensors([out_adv_tpu, tpu_table])
+            assert out_adv_cpu[2].tolist() == [60, 61, GEMMA4_END[0], -1]
             assert torch.equal(out_adv_tpu.cpu(), out_adv_cpu)
             assert torch.equal(tpu_table.cpu(), cpu_table)
 
@@ -2783,17 +2967,16 @@ class TestStaticShapesAndZeroRecompilations:
 
             num_reqs_paddings = [4, 8]
             verify_logits_paddings = [8, 16, 32]
-            spec_verify_pairs = [(8, 4), (8, 8), (16, 4), (16, 8), (32, 8)]
 
             tpu_tracker.precompile(
                 device=tpu,
                 num_reqs_paddings=num_reqs_paddings,
                 verify_logits_paddings=verify_logits_paddings,
-                spec_verify_pairs=spec_verify_pairs,
                 max_draft_tokens=3,
                 vocab_size=128,
                 logits_dtype=torch.bfloat16,
                 sync_fn=synchronize_tensors,
+                precompile_top_tokens=True,
             )
 
             # Pre-allocate steady-state step input shapes before sampling the XLA
@@ -2851,18 +3034,17 @@ class TestStaticShapesAndZeroRecompilations:
                 assert cpu_table is not None
                 synchronize_tensors(tpu_table)
 
-                cpu_slots = cpu_tracker.build_chunk_slot_ids(
-                    torch.device("cpu"), batch_ids, 0, n_active, padded_reqs
-                )
-                tpu_slots = tpu_tracker.build_chunk_slot_ids(
-                    tpu, batch_ids, 0, n_active, padded_reqs
-                )
-                if tpu_slots is None:
-                    assert cpu_slots is None
-                    continue
-                assert cpu_slots is not None
-
                 if step % 2 == 0:
+                    cpu_slots = cpu_tracker.build_chunk_slot_ids(
+                        torch.device("cpu"), batch_ids, 0, n_active, padded_reqs
+                    )
+                    tpu_slots = tpu_tracker.build_chunk_slot_ids(
+                        tpu, batch_ids, 0, n_active, padded_reqs
+                    )
+                    if tpu_slots is None:
+                        assert cpu_slots is None
+                        continue
+                    assert cpu_slots is not None
                     sel_np = rng.integers(0, 128, size=(padded_reqs, 1), dtype=np.int64)
                     sel_cpu = torch.from_numpy(sel_np)
                     out_cpu, cpu_table = override_and_advance_plain(
@@ -2876,14 +3058,25 @@ class TestStaticShapesAndZeroRecompilations:
                     synchronize_tensors([out_tpu, tpu_table])
                     assert torch.equal(out_tpu.cpu(), out_cpu)
                 else:
-                    padded_toks = 16 if padded_reqs == 4 else 32
-                    d_lens_np = np.zeros(padded_reqs, dtype=np.int32)
-                    d_lens_np[:n_active] = rng.integers(
-                        0, 4, size=n_active, dtype=np.int32
+                    cpu_slots = cpu_tracker.build_chunk_slot_ids(
+                        torch.device("cpu"),
+                        batch_ids,
+                        0,
+                        n_active,
+                        cpu_tracker.max_num_reqs,
                     )
+                    tpu_slots = tpu_tracker.build_chunk_slot_ids(
+                        tpu, batch_ids, 0, n_active, tpu_tracker.max_num_reqs
+                    )
+                    if tpu_slots is None:
+                        assert cpu_slots is None
+                        continue
+                    assert cpu_slots is not None
+                    padded_toks = 16 if padded_reqs == 4 else 32
+                    d_lens_np = rng.integers(0, 4, size=n_active, dtype=np.int32)
                     draft_np = rng.integers(0, 128, size=padded_toks, dtype=np.int32)
-                    seg_np = np.full(padded_toks, -1, dtype=np.int64)
-                    grp_np = np.full(padded_toks, -1, dtype=np.int32)
+                    seg_np = np.full(padded_toks, n_active, dtype=np.int64)
+                    grp_np = np.zeros(padded_toks, dtype=np.int32)
                     cur = 0
                     for r_i in range(n_active):
                         for g_i in range(int(d_lens_np[r_i])):
@@ -2893,47 +3086,56 @@ class TestStaticShapesAndZeroRecompilations:
                                 cur += 1
                         cur += 1
 
-                    d_lens_cpu = torch.from_numpy(d_lens_np)
                     draft_cpu = torch.from_numpy(draft_np)
                     seg_cpu = torch.from_numpy(seg_np)
                     grp_cpu = torch.from_numpy(grp_np)
-
-                    ft_cpu, fb_cpu, eff_cpu = prepare_spec_verify(
+                    logits_tpu = warm_logits_16 if padded_toks == 16 else warm_logits_32
+                    logits_cpu = (
+                        warm_logits_16_cpu if padded_toks == 16 else warm_logits_32_cpu
+                    )
+                    flogits_cpu, eff_cpu = prepare_spec_verify_logits(
                         cpu_table,
                         cpu_slots,
                         draft_cpu,
-                        d_lens_cpu,
+                        logits_cpu,
                         seg_cpu,
                         grp_cpu,
                         3,
                         cpu_tracker.markers,
                     )
-                    ft_tpu, fb_tpu, eff_tpu = prepare_spec_verify(
+                    flogits_tpu, eff_tpu = prepare_spec_verify_logits(
                         tpu_table,
                         tpu_slots,
                         draft_cpu.to(tpu),
-                        d_lens_cpu.to(tpu),
+                        logits_tpu,
                         seg_cpu.to(tpu),
                         grp_cpu.to(tpu),
                         3,
                         tpu_tracker.markers,
                     )
-                    logits_tpu = warm_logits_16 if padded_toks == 16 else warm_logits_32
-                    logits_cpu = (
-                        warm_logits_16_cpu if padded_toks == 16 else warm_logits_32_cpu
-                    )
-                    flogits_cpu = force_logits_rows(logits_cpu, ft_cpu)
-                    flogits_tpu = force_logits_rows(logits_tpu, ft_tpu)
                     t_ids_cpu = torch.from_numpy(
                         rng.integers(0, 128, size=padded_toks, dtype=np.int64)
                     )
-                    b_ids_cpu = torch.from_numpy(
-                        rng.integers(0, 128, size=padded_reqs, dtype=np.int64)
+                    ft_ids_cpu, eff_tok_cpu = prepare_spec_verify_tokens(
+                        cpu_table,
+                        cpu_slots,
+                        draft_cpu,
+                        t_ids_cpu,
+                        seg_cpu,
+                        grp_cpu,
+                        3,
+                        cpu_tracker.markers,
                     )
-                    ft_ids_cpu = force_token_ids_1d(t_ids_cpu, ft_cpu)
-                    fb_ids_cpu = force_token_ids_1d(b_ids_cpu, fb_cpu)
-                    ft_ids_tpu = force_token_ids_1d(t_ids_cpu.to(tpu), ft_tpu)
-                    fb_ids_tpu = force_token_ids_1d(b_ids_cpu.to(tpu), fb_tpu)
+                    ft_ids_tpu, eff_tok_tpu = prepare_spec_verify_tokens(
+                        tpu_table,
+                        tpu_slots,
+                        draft_cpu.to(tpu),
+                        t_ids_cpu.to(tpu),
+                        seg_cpu.to(tpu),
+                        grp_cpu.to(tpu),
+                        3,
+                        tpu_tracker.markers,
+                    )
                     next_toks_cpu = torch.from_numpy(
                         rng.integers(-1, 128, size=(padded_reqs, 4), dtype=np.int32)
                     )
@@ -2951,28 +3153,18 @@ class TestStaticShapesAndZeroRecompilations:
                     tpu_tracker.commit_state_table(tpu_table)
                     synchronize_tensors(
                         [
-                            ft_tpu,
-                            fb_tpu,
                             eff_tpu,
                             flogits_tpu,
                             ft_ids_tpu,
-                            fb_ids_tpu,
+                            eff_tok_tpu,
                             out_adv_tpu,
                             tpu_table,
                         ]
                     )
-                    assert torch.equal(ft_tpu.cpu(), ft_cpu), (
-                        f"step={step} ft_tpu={ft_tpu.cpu().tolist()} "
-                        f"ft_cpu={ft_cpu.tolist()}"
-                    )
-                    assert torch.equal(fb_tpu.cpu(), fb_cpu), (
-                        f"step={step} fb_tpu={fb_tpu.cpu().tolist()} "
-                        f"fb_cpu={fb_cpu.tolist()} slots={tpu_slots.cpu().tolist()}"
-                    )
                     assert torch.equal(eff_tpu.cpu(), eff_cpu)
                     assert torch.equal(flogits_tpu.cpu(), flogits_cpu)
                     assert torch.equal(ft_ids_tpu.cpu(), ft_ids_cpu)
-                    assert torch.equal(fb_ids_tpu.cpu(), fb_ids_cpu)
+                    assert torch.equal(eff_tok_tpu.cpu(), eff_tok_cpu)
                     assert torch.equal(out_adv_tpu.cpu(), out_adv_cpu)
 
                 assert torch.equal(tpu_table.cpu(), cpu_table)

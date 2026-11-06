@@ -25,6 +25,7 @@ speculative verification advance without host stalls or XLA recompilations.
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -532,11 +533,10 @@ def _override_and_advance_plain_impl(
     return out_tokens, _scatter_state_rows(state_table, slot_ids, next_st)
 
 
-def _prepare_spec_verify_impl(
+def _prepare_spec_verify_drafts(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
     draft_token_ids: torch.Tensor,
-    draft_lengths: torch.Tensor,
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
@@ -546,51 +546,64 @@ def _prepare_spec_verify_impl(
     nat_fail: tuple[int, ...],
     end_ids: tuple[int, ...],
     end_fail: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-draft-row forced token IDs and invalidated draft IDs.
+
+    ``slot_ids`` is sized to ``max_num_reqs`` during serving so the compiled
+    spec-verify kernels depend only on ``draft_token_ids.shape[0]``
+    (``verify_logits_paddings``) rather than the ``(num_tokens, num_reqs)``
+    Cartesian product. ``SpecDecodeMetadata`` marks padded draft positions with
+    ``segment_ids == real_num_reqs``, where ``slot_ids[real_num_reqs] == 0``
+    (or ``real_num_reqs == max_num_reqs``, out of ``[0, num_reqs)``).
+    """
     num_reqs = slot_ids.shape[0]
     active_slot = slot_ids > 0
     safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
         torch.int64
     )
     st = torch.index_select(state_table, 0, safe_slots)
-    no_req_tok = torch.full(
-        (num_reqs,), NO_FORCED_TOKEN, dtype=torch.int32, device=state_table.device
-    )
-
     draft_i32 = draft_token_ids.to(torch.int32)
-    forced_target_ids = torch.full_like(draft_i32, NO_FORCED_TOKEN)
+    no_tok = torch.full_like(draft_i32, NO_FORCED_TOKEN)
 
     if max_draft_tokens > 0:
-        req_rows = torch.arange(
-            num_reqs, dtype=segment_ids.dtype, device=state_table.device
-        ).unsqueeze(1)
-        seg_match = (
-            (segment_ids.unsqueeze(0) == req_rows)
-            & (group_indices >= 0).unsqueeze(0)
-            & (
-                group_indices.unsqueeze(0)
-                < draft_lengths.to(group_indices.dtype).unsqueeze(1)
-            )
+        in_bounds = (
+            (segment_ids >= 0)
+            & (segment_ids < num_reqs)
+            & (group_indices >= 0)
+            & (group_indices < max_draft_tokens)
         )
+        safe_seg = torch.where(
+            in_bounds, segment_ids, torch.zeros_like(segment_ids)
+        ).to(torch.int64)
+        safe_grp = torch.where(
+            in_bounds, group_indices, torch.zeros_like(group_indices)
+        ).to(torch.int64)
+        flat_idx = safe_seg * max_draft_tokens + safe_grp
+        cells = torch.arange(
+            num_reqs * max_draft_tokens,
+            dtype=torch.int64,
+            device=state_table.device,
+        ).unsqueeze(1)
+        cell_match = in_bounds.unsqueeze(0) & (cells == flat_idx.unsqueeze(0))
+        any_cell = cell_match.any(dim=1)
+        has_draft = any_cell.reshape(num_reqs, max_draft_tokens)
+        draft_grid = torch.where(
+            any_cell,
+            torch.where(cell_match, draft_i32.unsqueeze(0), _AMAX_SENTINEL).amax(dim=1),
+            NO_FORCED_TOKEN,
+        ).reshape(num_reqs, max_draft_tokens)
+
+        no_req_tok = torch.full(
+            (num_reqs,), NO_FORCED_TOKEN, dtype=torch.int32, device=state_table.device
+        )
+        forced_cols: list[torch.Tensor] = []
         for step_idx in range(max_draft_tokens):
             step_forced_req = torch.where(
                 active_slot, _query_forced_token_tensor(st, end_ids), no_req_tok
             )
-            pos_match = seg_match & (group_indices.unsqueeze(0) == step_idx)
-            step_forced_tok = torch.where(
-                pos_match, step_forced_req.unsqueeze(1), _AMAX_SENTINEL
-            ).amax(dim=0)
-            forced_target_ids = torch.where(
-                pos_match.any(dim=0), step_forced_tok, forced_target_ids
-            )
-            d_tok = torch.where(
-                pos_match.any(dim=1),
-                torch.where(pos_match, draft_i32.unsqueeze(0), _AMAX_SENTINEL).amax(
-                    dim=1
-                ),
-                no_req_tok,
-            )
-            step_active = active_slot & (step_idx < draft_lengths) & (d_tok >= 0)
+            forced_cols.append(step_forced_req)
+            d_tok = draft_grid[:, step_idx]
+            step_active = active_slot & has_draft[:, step_idx] & (d_tok >= 0)
             next_st = _advance_state_tensor(
                 st,
                 d_tok,
@@ -602,16 +615,19 @@ def _prepare_spec_verify_impl(
                 end_fail,
             )
             st = torch.where(step_active.unsqueeze(-1), next_st, st)
+        forced_flat = torch.stack(forced_cols, dim=1).reshape(-1)
+        forced_target_ids = torch.where(
+            in_bounds, torch.index_select(forced_flat, 0, flat_idx), no_tok
+        )
+    else:
+        forced_target_ids = no_tok
 
-    forced_bonus_ids = torch.where(
-        active_slot, _query_forced_token_tensor(st, end_ids), no_req_tok
-    )
     effective_draft_ids = torch.where(
         (forced_target_ids >= 0) & (draft_i32 != forced_target_ids),
-        torch.full_like(draft_i32, NO_FORCED_TOKEN),
+        no_tok,
         draft_i32,
     )
-    return forced_target_ids, forced_bonus_ids, effective_draft_ids
+    return forced_target_ids, effective_draft_ids
 
 
 def _force_logits_rows_impl(
@@ -635,6 +651,76 @@ def _force_token_ids_1d_impl(
     return torch.where(forced_ids >= 0, forced_ids.to(token_ids.dtype), token_ids)
 
 
+def _prepare_spec_verify_logits_impl(
+    state_table: torch.Tensor,
+    slot_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_logits: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    start_ids: tuple[int, ...],
+    start_fail: tuple[int, ...],
+    nat_ids: tuple[int, ...],
+    nat_fail: tuple[int, ...],
+    end_ids: tuple[int, ...],
+    end_fail: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forced_target_ids, effective_draft_ids = _prepare_spec_verify_drafts(
+        state_table,
+        slot_ids,
+        draft_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        start_ids,
+        start_fail,
+        nat_ids,
+        nat_fail,
+        end_ids,
+        end_fail,
+    )
+    return (
+        _force_logits_rows_impl(target_logits, forced_target_ids),
+        effective_draft_ids,
+    )
+
+
+def _prepare_spec_verify_tokens_impl(
+    state_table: torch.Tensor,
+    slot_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_argmax: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    start_ids: tuple[int, ...],
+    start_fail: tuple[int, ...],
+    nat_ids: tuple[int, ...],
+    nat_fail: tuple[int, ...],
+    end_ids: tuple[int, ...],
+    end_fail: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forced_target_ids, effective_draft_ids = _prepare_spec_verify_drafts(
+        state_table,
+        slot_ids,
+        draft_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        start_ids,
+        start_fail,
+        nat_ids,
+        nat_fail,
+        end_ids,
+        end_fail,
+    )
+    return (
+        _force_token_ids_1d_impl(target_argmax, forced_target_ids),
+        effective_draft_ids,
+    )
+
+
 def _advance_spec_states_impl(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
@@ -647,26 +733,39 @@ def _advance_spec_states_impl(
     end_ids: tuple[int, ...],
     end_fail: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    active_slot = slot_ids > 0
-    safe_slots = torch.where(active_slot, slot_ids, torch.zeros_like(slot_ids)).to(
-        torch.int64
-    )
+    """Override forced bonus/accepted tokens in ``next_tokens`` and commit KMP state.
+
+    ``RejectionSampler`` only writes ``bonus_token_ids`` into ``next_tokens``
+    at ``accepted_count`` when all drafts pass; overriding ``tok >= 0`` here
+    with ``_query_forced_token_tensor(st, end_ids)`` handles bonus forcing in
+    the same pass that advances ``state_table`` without a separate 1D kernel.
+    """
+    chunk_slots = slot_ids[: next_tokens.shape[0]]
+    active_slot = chunk_slots > 0
+    safe_slots = torch.where(
+        active_slot, chunk_slots, torch.zeros_like(chunk_slots)
+    ).to(torch.int64)
     st = torch.index_select(state_table, 0, safe_slots)
+    out_cols: list[torch.Tensor] = []
     for col_idx in range(max_draft_tokens + 1):
         tok = next_tokens[:, col_idx].to(torch.int32)
+        valid_col = active_slot & (tok >= 0)
+        forced_id = _query_forced_token_tensor(st, end_ids)
+        eff_tok = torch.where(valid_col & (forced_id >= 0), forced_id, tok)
+        out_cols.append(eff_tok.to(next_tokens.dtype))
         next_st = _advance_state_tensor(
-            st, tok, start_ids, start_fail, nat_ids, nat_fail, end_ids, end_fail
+            st, eff_tok, start_ids, start_fail, nat_ids, nat_fail, end_ids, end_fail
         )
-        st = torch.where((active_slot & (tok >= 0)).unsqueeze(-1), next_st, st)
-    return next_tokens + 0, _scatter_state_rows(state_table, slot_ids, st)
+        st = torch.where(valid_col.unsqueeze(-1), next_st, st)
+    out_tokens = torch.stack(out_cols, dim=1)
+    return out_tokens, _scatter_state_rows(state_table, chunk_slots, st)
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _seed_states_tpu = _tpu_compile(_seed_states_impl)
 _override_and_advance_plain_tpu = _tpu_compile(_override_and_advance_plain_impl)
-_prepare_spec_verify_tpu = _tpu_compile(_prepare_spec_verify_impl)
-_force_logits_rows_tpu = _tpu_compile(_force_logits_rows_impl)
-_force_token_ids_1d_tpu = _tpu_compile(_force_token_ids_1d_impl)
+_prepare_spec_verify_logits_tpu = _tpu_compile(_prepare_spec_verify_logits_impl)
+_prepare_spec_verify_tokens_tpu = _tpu_compile(_prepare_spec_verify_tokens_impl)
 _advance_spec_states_tpu = _tpu_compile(_advance_spec_states_impl)
 
 
@@ -691,26 +790,26 @@ def override_and_advance_plain(
     return fn(state_table, slot_ids, selected_token_ids, *markers.kernel_args())
 
 
-def prepare_spec_verify(
+def prepare_spec_verify_logits(
     state_table: torch.Tensor,
     slot_ids: torch.Tensor,
     draft_token_ids: torch.Tensor,
-    draft_lengths: torch.Tensor,
+    target_logits: torch.Tensor,
     segment_ids: torch.Tensor,
     group_indices: torch.Tensor,
     max_draft_tokens: int,
     markers: ThinkingBudgetMarkers,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     fn = (
-        _prepare_spec_verify_tpu
+        _prepare_spec_verify_logits_tpu
         if state_table.device.type == "tpu"
-        else _prepare_spec_verify_impl
+        else _prepare_spec_verify_logits_impl
     )
     return fn(
         state_table,
         slot_ids,
         draft_token_ids,
-        draft_lengths,
+        target_logits,
         segment_ids,
         group_indices,
         max_draft_tokens,
@@ -718,24 +817,31 @@ def prepare_spec_verify(
     )
 
 
-def force_logits_rows(logits: torch.Tensor, forced_ids: torch.Tensor) -> torch.Tensor:
+def prepare_spec_verify_tokens(
+    state_table: torch.Tensor,
+    slot_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_argmax: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    markers: ThinkingBudgetMarkers,
+) -> tuple[torch.Tensor, torch.Tensor]:
     fn = (
-        _force_logits_rows_tpu
-        if logits.device.type == "tpu"
-        else _force_logits_rows_impl
+        _prepare_spec_verify_tokens_tpu
+        if state_table.device.type == "tpu"
+        else _prepare_spec_verify_tokens_impl
     )
-    return fn(logits, forced_ids)
-
-
-def force_token_ids_1d(
-    token_ids: torch.Tensor, forced_ids: torch.Tensor
-) -> torch.Tensor:
-    fn = (
-        _force_token_ids_1d_tpu
-        if token_ids.device.type == "tpu"
-        else _force_token_ids_1d_impl
+    return fn(
+        state_table,
+        slot_ids,
+        draft_token_ids,
+        target_argmax,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        *markers.kernel_args(),
     )
-    return fn(token_ids, forced_ids)
 
 
 def advance_spec_states(
@@ -796,10 +902,28 @@ class ThinkingBudgetTracker:
         self._slot_upload_cache: dict[
             tuple[torch.device, int, int], tuple[bytes, torch.Tensor]
         ] = {}
+        self._state_epoch: int = 0
+        self._prepared_key: tuple[int, int, tuple[str | None, ...]] | None = None
+        self._prepared_has_tracked: bool = False
+        self._chunk_fast_cache: dict[
+            tuple[
+                int,
+                torch.device,
+                int,
+                int,
+                tuple[str | None, ...],
+                frozenset[str],
+            ],
+            torch.Tensor | None,
+        ] = {}
 
     @property
     def enabled(self) -> bool:
         return self._markers is not None
+
+    @property
+    def max_num_reqs(self) -> int:
+        return self._max_num_reqs
 
     @property
     def markers(self) -> ThinkingBudgetMarkers | None:
@@ -811,6 +935,11 @@ class ThinkingBudgetTracker:
 
     def __bool__(self) -> bool:
         return self._markers is not None and bool(self._budgets)
+
+    def _bump_epoch(self) -> None:
+        self._state_epoch += 1
+        self._prepared_key = None
+        self._chunk_fast_cache.clear()
 
     def commit_state_table(self, state_table: torch.Tensor) -> None:
         self._state_table = state_table
@@ -828,28 +957,39 @@ class ThinkingBudgetTracker:
             table[:, COL_BUDGET] = -1
             self._state_table = table.to(device)
             self._slot_upload_cache.clear()
+            self._bump_epoch()
         return self._state_table
 
     def _release_slot(self, req_id: str) -> None:
         slot = self._slot_by_req_id.pop(req_id, None)
         if slot is not None:
             self._free_slots.append(slot)
+            self._bump_epoch()
 
     def discard(self, req_ids: Iterable[str]) -> None:
         if not self._budgets:
             return
+        changed = False
         for req_id in req_ids:
-            self._budgets.pop(req_id, None)
-            self._dirty_states.pop(req_id, None)
+            if self._budgets.pop(req_id, None) is not None:
+                changed = True
+            if self._dirty_states.pop(req_id, None) is not None:
+                changed = True
             self._release_slot(req_id)
+        if changed:
+            self._bump_epoch()
 
     def on_preempted(self, req_ids: Iterable[str] | None) -> None:
         if not req_ids or not self._budgets:
             return
+        changed = False
         for req_id in req_ids:
             if req_id in self._budgets:
-                self._dirty_states.pop(req_id, None)
+                if self._dirty_states.pop(req_id, None) is not None:
+                    changed = True
                 self._release_slot(req_id)
+        if changed:
+            self._bump_epoch()
 
     def add(
         self,
@@ -870,6 +1010,7 @@ class ThinkingBudgetTracker:
         self._dirty_states[req_id] = compute_sequence_state(
             prompt_token_ids or (), clamped_budget, self._markers
         )
+        self._bump_epoch()
 
     def on_resumed(
         self,
@@ -878,6 +1019,7 @@ class ThinkingBudgetTracker:
     ) -> None:
         if self._markers is None or not self._budgets:
             return
+        changed = False
         for req_id in resumed_req_ids:
             budget = self._budgets.get(req_id)
             req_state = None if budget is None else requests.get(req_id)
@@ -886,6 +1028,9 @@ class ThinkingBudgetTracker:
             self._dirty_states[req_id] = _compute_request_state(
                 req_state, budget, self._markers
             )
+            changed = True
+        if changed:
+            self._bump_epoch()
 
     def _allocate_slot(self, req_id: str) -> int:
         existing = self._slot_by_req_id.get(req_id)
@@ -897,6 +1042,7 @@ class ThinkingBudgetTracker:
         )
         slot = self._free_slots.pop()
         self._slot_by_req_id[req_id] = slot
+        self._bump_epoch()
         return slot
 
     def prepare_step(
@@ -908,14 +1054,26 @@ class ThinkingBudgetTracker:
         """Ensure all scheduled budgeted requests own seeded slots on ``device``."""
         if self._markers is None or not self._budgets:
             return None
+        batch_tuple = tuple(batch_req_ids)
+        prep_key = (self._state_epoch, len(requests), batch_tuple)
+        if (
+            not self._dirty_states
+            and self._state_table is not None
+            and self._prepared_key == prep_key
+            and _same_target_device(self._state_table.device, device)
+        ):
+            return self._state_table if self._prepared_has_tracked else None
+
         batch_tracked = list(
             dict.fromkeys(
                 req_id
-                for req_id in batch_req_ids
+                for req_id in batch_tuple
                 if req_id is not None and req_id in self._budgets
             )
         )
         if not batch_tracked:
+            self._prepared_key = (self._state_epoch, len(requests), batch_tuple)
+            self._prepared_has_tracked = False
             return None
 
         if requests:
@@ -956,6 +1114,8 @@ class ThinkingBudgetTracker:
                     torch.from_numpy(vals_np).to(device),
                 )
             self._state_table = state_table
+        self._prepared_key = (self._state_epoch, len(requests), batch_tuple)
+        self._prepared_has_tracked = True
         return state_table
 
     def build_chunk_slot_ids(
@@ -965,23 +1125,53 @@ class ThinkingBudgetTracker:
         start_idx: int,
         end_idx: int,
         padded_num_reqs: int,
-        is_partial_prefill: Callable[[str], bool] | None = None,
+        discard_req_ids: AbstractSet[str] | Callable[[str], bool] | None = None,
     ) -> torch.Tensor | None:
         """Build ``[padded_num_reqs]`` int32 slot IDs for ``[start_idx, end_idx)``."""
+        canon_dev = (
+            self._state_table.device
+            if self._state_table is not None
+            and _same_target_device(self._state_table.device, device)
+            else device
+        )
+        upper = min(end_idx, len(batch_req_ids), start_idx + padded_num_reqs)
+        use_set = not callable(discard_req_ids)
+        fast_key = None
+        if use_set:
+            chunk_ids = tuple(batch_req_ids[start_idx:upper])
+            disc_set = (
+                frozenset(
+                    r for r in chunk_ids if r is not None and r in discard_req_ids
+                )
+                if discard_req_ids
+                else frozenset()
+            )
+            fast_key = (
+                self._state_epoch,
+                canon_dev,
+                padded_num_reqs,
+                start_idx,
+                chunk_ids,
+                disc_set,
+            )
+            if fast_key in self._chunk_fast_cache:
+                return self._chunk_fast_cache[fast_key]
+
         slots_np = np.zeros(padded_num_reqs, dtype=np.int32)
         seen_slots: set[int] = set()
         any_active = False
-        upper = min(end_idx, len(batch_req_ids))
         for batch_i in range(start_idx, upper):
             local_i = batch_i - start_idx
-            if local_i >= padded_num_reqs:
-                break
             req_id = batch_req_ids[batch_i]
             if req_id is None:
                 continue
             slot = self._slot_by_req_id.get(req_id)
-            if slot is None or (
-                is_partial_prefill is not None and is_partial_prefill(req_id)
+            if slot is None:
+                continue
+            if discard_req_ids is not None and (
+                discard_req_ids(req_id)
+                if callable(discard_req_ids)
+                else req_id in discard_req_ids
             ):
                 continue
             assert slot not in seen_slots, (
@@ -991,24 +1181,27 @@ class ThinkingBudgetTracker:
             slots_np[local_i] = slot
             any_active = True
         if not any_active:
+            if fast_key is not None:
+                if len(self._chunk_fast_cache) >= _MAX_SLOT_UPLOAD_CACHE:
+                    self._chunk_fast_cache.clear()
+                self._chunk_fast_cache[fast_key] = None
             return None
-        canon_dev = (
-            self._state_table.device
-            if self._state_table is not None
-            and _same_target_device(self._state_table.device, device)
-            else device
-        )
         cache_key = (canon_dev, padded_num_reqs, start_idx)
         payload = slots_np.tobytes()
         cached = self._slot_upload_cache.get(cache_key)
         if cached is not None and cached[0] == payload:
-            return cached[1]
-        if len(self._slot_upload_cache) >= _MAX_SLOT_UPLOAD_CACHE:
-            self._slot_upload_cache.clear()
-        # Synchronous .to(device) avoids unfenced async H2D reads; caching
-        # skips redundant H2D copies across steady-state decode steps.
-        dev_slots = torch.from_numpy(slots_np).to(device)
-        self._slot_upload_cache[cache_key] = (payload, dev_slots)
+            dev_slots = cached[1]
+        else:
+            if len(self._slot_upload_cache) >= _MAX_SLOT_UPLOAD_CACHE:
+                self._slot_upload_cache.clear()
+            # Synchronous .to(device) avoids unfenced async H2D reads; caching
+            # skips redundant H2D copies across steady-state decode steps.
+            dev_slots = torch.from_numpy(slots_np).to(device)
+            self._slot_upload_cache[cache_key] = (payload, dev_slots)
+        if fast_key is not None:
+            if len(self._chunk_fast_cache) >= _MAX_SLOT_UPLOAD_CACHE:
+                self._chunk_fast_cache.clear()
+            self._chunk_fast_cache[fast_key] = dev_slots
         return dev_slots
 
     def precompile(
@@ -1016,12 +1209,11 @@ class ThinkingBudgetTracker:
         device: torch.device,
         num_reqs_paddings: Sequence[int],
         verify_logits_paddings: Sequence[int],
-        spec_verify_pairs: Sequence[tuple[int, int]],
         max_draft_tokens: int,
         vocab_size: int,
         logits_dtype: torch.dtype,
         sync_fn: Callable[..., None],
-        token_1d_paddings: Sequence[int] | None = None,
+        precompile_top_tokens: bool = False,
         dummy_logits_fn: Callable[[int], torch.Tensor] | None = None,
     ) -> None:
         """Pre-warm all thinking-budget subgraphs across compiled bucket shapes."""
@@ -1049,23 +1241,16 @@ class ThinkingBudgetTracker:
             logger.info("  -- plain num_seqs: %d", num_reqs)
 
         self._state_table = state_table
-        if not spec_verify_pairs:
+        if max_draft_tokens <= 0 or not verify_logits_paddings:
             return
 
-        for num_tokens, num_reqs in spec_verify_pairs:
-            forced_target, forced_bonus, eff_drafts = prepare_spec_verify(
-                state_table,
-                torch.zeros(num_reqs, dtype=torch.int32).to(device),
-                torch.zeros(num_tokens, dtype=torch.int32).to(device),
-                torch.zeros(num_reqs, dtype=torch.int32).to(device),
-                torch.zeros(num_tokens, dtype=torch.int64).to(device),
-                torch.zeros(num_tokens, dtype=torch.int32).to(device),
-                max_draft_tokens,
-                markers,
-            )
-            sync_fn([forced_target, forced_bonus, eff_drafts])
-
+        spec_slots = torch.zeros(self._max_num_reqs, dtype=torch.int32).to(device)
         for num_tokens in verify_logits_paddings:
+            draft_ids = torch.zeros(num_tokens, dtype=torch.int32).to(device)
+            seg_ids = torch.full(
+                (num_tokens,), self._max_num_reqs, dtype=torch.int64
+            ).to(device)
+            grp_ids = torch.zeros(num_tokens, dtype=torch.int32).to(device)
             logits = (
                 dummy_logits_fn(num_tokens)
                 if dummy_logits_fn is not None
@@ -1073,34 +1258,34 @@ class ThinkingBudgetTracker:
                     device
                 )
             )
-            sync_fn(
-                force_logits_rows(
-                    logits,
-                    torch.full((num_tokens,), NO_FORCED_TOKEN, dtype=torch.int32).to(
-                        device
-                    ),
-                )
+            out_logits, eff_drafts = prepare_spec_verify_logits(
+                state_table,
+                spec_slots,
+                draft_ids,
+                logits,
+                seg_ids,
+                grp_ids,
+                max_draft_tokens,
+                markers,
             )
-
-        lengths_1d = (
-            token_1d_paddings
-            if token_1d_paddings is not None
-            else sorted(set(num_reqs_paddings) | set(verify_logits_paddings))
-        )
-        for length in lengths_1d:
-            sync_fn(
-                force_token_ids_1d(
-                    torch.zeros(length, dtype=torch.int64).to(device),
-                    torch.full((length,), NO_FORCED_TOKEN, dtype=torch.int32).to(
-                        device
-                    ),
+            sync_fn([out_logits, eff_drafts])
+            if precompile_top_tokens:
+                out_toks, eff_top_drafts = prepare_spec_verify_tokens(
+                    state_table,
+                    spec_slots,
+                    draft_ids,
+                    torch.zeros(num_tokens, dtype=torch.int64).to(device),
+                    seg_ids,
+                    grp_ids,
+                    max_draft_tokens,
+                    markers,
                 )
-            )
+                sync_fn([out_toks, eff_top_drafts])
 
         for num_reqs in num_reqs_paddings:
             out_spec, state_table = advance_spec_states(
                 state_table,
-                torch.zeros(num_reqs, dtype=torch.int32).to(device),
+                spec_slots,
                 torch.full(
                     (num_reqs, max_draft_tokens + 1),
                     NO_FORCED_TOKEN,
