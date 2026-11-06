@@ -844,7 +844,7 @@ def test_qwen38_multi_region_l8_and_single_backbone() -> None:
     # Negative control: scaling final_norm by -4.0 must trigger _sync_jax_weights
     # and scale the output by -4.0.
     out_l8_orig = out_l8.detach().to(torch.float32).clone()
-    prog.set_interpret_mode(True)
+    prog.set_interpret_mode(interpret=True)
     prog.w_flat[-1] = prog.w_flat[-1] * -4.0
     step_fn_bad = prog.build(Bucket(1, 4))
     fwd_l8_bad = ForwardView(

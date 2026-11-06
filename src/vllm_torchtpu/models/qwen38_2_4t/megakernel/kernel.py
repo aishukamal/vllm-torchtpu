@@ -1434,6 +1434,7 @@ def _restore_pool_from_kernel(
 def _resolve_step_mesh_and_interpret(
     cfg: Qwen38Config,
     mesh: Mesh | None,
+    *,
     interpret: bool | pltpu.InterpretParams | None,
 ) -> tuple[Mesh, bool | pltpu.InterpretParams]:
     """Resolve a valid `cfg.R` device mesh and default interpret flag."""

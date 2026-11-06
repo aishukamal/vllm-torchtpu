@@ -571,7 +571,7 @@ class Qwen38MoeProgram:
         return result
 
     def set_interpret_mode(
-        self, interpret: bool | pltpu.InterpretParams | None
+        self, *, interpret: bool | pltpu.InterpretParams | None = None
     ) -> None:
         """Update Pallas interpret execution mode used on subsequent `build` calls."""
         self._interpret = interpret
