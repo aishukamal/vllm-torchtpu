@@ -45,7 +45,6 @@ logger = init_logger(__name__)
 
 INT32_MAX: Final[int] = 2_147_483_647
 NO_FORCED_TOKEN: Final[int] = -1
-_MAX_SLOT_UPLOAD_CACHE: Final[int] = 32
 
 # Per-slot int32 columns in ``state_table`` ([capacity, NUM_STATE_COLS]).
 COL_BUDGET: Final[int] = 0
@@ -192,40 +191,27 @@ def query_forced_token_py(state: StateTuple, markers: ThinkingBudgetMarkers) -> 
     return NO_FORCED_TOKEN
 
 
-def _find_next_token(seq: list[int] | tuple[int, ...], val: int, start: int) -> int:
-    try:
-        return seq.index(val, start)
-    except ValueError:
-        return len(seq)
-
-
 def advance_sequence_state(
     state: StateTuple,
     tokens: Sequence[int] | np.ndarray,
     markers: ThinkingBudgetMarkers,
 ) -> StateTuple:
-    """Advance ``state`` across ``tokens``, jumping directly between marker hits.
+    """Advance ``state`` across ``tokens``, jumping between marker candidates.
 
     Whenever partial multi-token marker state is clear
-    (``start_match == nat_end_match == end_match == forcing_end == 0``), no
-    token outside ``{start_ids[0]}`` can change any state column while
-    ``in_think == 0``, and while ``in_think == 1`` a run of ``k`` tokens outside
-    ``{natural_end_ids[0], end_ids[0]}`` only advances ``think_count`` to
-    ``min(think_count + k, INT32_MAX)``. For sequences of at least 32 tokens,
-    monotonic ``list.index`` lookups (for ``list`` / ``tuple`` inputs) or
-    ``np.flatnonzero`` over candidate first-token positions (for array inputs)
-    skip non-marker spans in linear worst-case time without copying ``list``
-    or ``tuple`` inputs.
+    (``start_match == nat_end_match == end_match == forcing_end == 0``), tokens
+    outside ``{start_ids[0], natural_end_ids[0], end_ids[0]}`` cannot alter
+    ``in_think == 0`` state and only advance ``think_count`` when
+    ``in_think == 1``, so ``np.flatnonzero`` skips non-marker spans directly.
     """
     if state[COL_BUDGET] < 0:
         return UNTRACKED_STATE
-    n_toks = len(tokens)
-    if n_toks == 0:
+    arr = np.asarray(tokens, dtype=np.int64)
+    n = int(arr.shape[0])
+    if n == 0:
         return state
-    if n_toks < 32 or not (
-        markers.start_ids and markers.natural_end_ids and markers.end_ids
-    ):
-        for tok in tokens:
+    if not (markers.start_ids and markers.natural_end_ids and markers.end_ids):
+        for tok in arr.tolist():
             state = advance_state_py(state, int(tok), markers)
         return state
 
@@ -233,53 +219,11 @@ def advance_sequence_state(
     n0 = markers.natural_end_ids[0]
     e0 = markers.end_ids[0]
     budget = state[COL_BUDGET]
-
-    if isinstance(tokens, (list, tuple)):
-        n = n_toks
-        pos = 0
-        next_s0 = -1
-        next_n0 = -1
-        next_e0 = -1
-        while pos < n:
-            if (
-                state[COL_START_MATCH]
-                | state[COL_NAT_END_MATCH]
-                | state[COL_END_MATCH]
-                | state[COL_FORCING_END]
-            ) != 0:
-                state = advance_state_py(state, int(tokens[pos]), markers)
-                pos += 1
-                continue
-            if state[COL_IN_THINK] == 0:
-                if next_s0 < pos:
-                    next_s0 = _find_next_token(tokens, s0, pos)
-                pos = next_s0
-            else:
-                if next_e0 < pos:
-                    next_e0 = _find_next_token(tokens, e0, pos)
-                if n0 == e0:
-                    next_hit = next_e0
-                else:
-                    if next_n0 < pos:
-                        next_n0 = _find_next_token(tokens, n0, pos)
-                    next_hit = next_e0 if next_e0 <= next_n0 else next_n0
-                if next_hit > pos:
-                    new_cnt = min(state[COL_THINK_COUNT] + (next_hit - pos), INT32_MAX)
-                    state = (budget, 1, new_cnt, 0, 0, 0, 0)
-                    pos = next_hit
-            if pos < n:
-                state = advance_state_py(state, int(tokens[pos]), markers)
-                pos += 1
-        return state
-
-    arr = np.asarray(tokens, dtype=np.int64)
-    if n0 == e0:
-        hit_mask = arr == s0 if s0 == e0 else (arr == s0) | (arr == e0)
-    else:
-        hit_mask = (arr == s0) | (arr == n0) | (arr == e0)
+    hit_mask = (arr == s0) | (arr == e0)
+    if n0 != e0 and n0 != s0:
+        hit_mask |= arr == n0
     hits = np.flatnonzero(hit_mask)
     num_hits = int(hits.shape[0])
-    n = int(arr.shape[0])
     pos = 0
     hit_ptr = 0
 
@@ -325,9 +269,12 @@ def _compute_request_state(
 
     Placeholder invariants:
     * ``on_resumed`` runs in ``TPUModelRunner._update_states`` after
-      ``super()._update_states`` overwrites ``req_state.output_token_ids`` from
-      the scheduler's ``all_token_ids``, where async placeholders are ``-1``
-      (filtered out by ``out_arr >= 0`` below).
+      ``super()._update_states`` aligns ``req_state.output_token_ids`` to the
+      scheduler's committed ``num_output_tokens`` (truncating trailing ``[0]``
+      async placeholders when ``num_output_tokens == 0``, or replacing
+      ``req_state.output_token_ids`` from ``all_token_ids`` under async
+      scheduling when ``num_output_tokens > 0``); any negative scheduler
+      placeholders are skipped by ``out_arr >= 0``.
     * ``prepare_step`` only calls ``_compute_request_state`` on a cold reseed
       when a budgeted request has neither an allocated slot nor a seeded
       ``_dirty_states`` entry; ``TPUModelRunner.sample_tokens`` settles any
@@ -469,34 +416,32 @@ def _advance_state_tensor(
     return torch.where((budget >= 0).unsqueeze(-1), active_out, untracked)
 
 
+_AMAX_SENTINEL: Final[int] = -2_147_483_647
+
+
 def _scatter_state_rows(
     state_table: torch.Tensor, slot_ids: torch.Tensor, rows: torch.Tensor
 ) -> torch.Tensor:
     """Return ``state_table`` with ``out[slot_ids[i]] = rows[i]`` for active slots.
 
-    Inactive/padded lanes carry ``slot_ids[i] <= 0`` and are routed to sentinel
-    row ``0`` writing constant ``UNTRACKED_STATE`` (matching the out-of-bounds
-    sink pattern in ``_spec_logprob_row_tokens``), keeping work and temporary
-    memory linear in ``capacity + num_reqs`` rather than quadratic in
-    ``max_num_reqs``. Each positive slot ``slot_ids[i] > 0`` must appear at most
-    once per call.
+    Uses a masked broadcast + ``amax`` reduction (``<= 7 MiB`` at
+    ``max_num_reqs=512``) rather than ``Tensor.scatter(0, ...)``, whose XLA
+    lowering for dynamic colliding indices adds ~7 ms/step on TPU v7x. Each
+    positive slot ``slot_ids[i] > 0`` must appear at most once per call.
     """
     if state_table.device.type == "cpu" and not torch.compiler.is_compiling():
         pos_slots = slot_ids[slot_ids > 0]
         assert pos_slots.numel() == torch.unique(pos_slots).numel(), (
             "Duplicate positive slot IDs passed to _scatter_state_rows"
         )
-    active = slot_ids > 0
-    safe_slots = torch.where(active, slot_ids, 0).to(torch.int64)
-    col_idx = torch.arange(
-        NUM_STATE_COLS, dtype=state_table.dtype, device=state_table.device
-    ).unsqueeze(0)
-    untracked_row = torch.where(col_idx == COL_BUDGET, -1, 0).to(state_table.dtype)
-    safe_rows = torch.where(
-        active.unsqueeze(-1), rows.to(state_table.dtype), untracked_row
-    )
-    idx = safe_slots.unsqueeze(-1).expand(-1, NUM_STATE_COLS)
-    return state_table.scatter(0, idx, safe_rows)
+    table_idx = torch.arange(
+        state_table.shape[0], dtype=slot_ids.dtype, device=state_table.device
+    ).unsqueeze(1)
+    match = (slot_ids > 0).unsqueeze(0) & (table_idx == slot_ids.unsqueeze(0))
+    cand = torch.where(
+        match.unsqueeze(-1), rows.to(state_table.dtype).unsqueeze(0), _AMAX_SENTINEL
+    ).amax(dim=1)
+    return torch.where(match.any(dim=1, keepdim=True), cand, state_table)
 
 
 def _seed_states_impl(
@@ -588,19 +533,16 @@ def _prepare_spec_verify_drafts(
                 "Duplicate active (segment_id, group_index) in "
                 "_prepare_spec_verify_drafts"
             )
-        # Route unbudgeted and padded positions (`segment_ids == real_num_reqs`,
-        # where `slot_ids[real_num_reqs] == 0`) to sentinel cell `num_cells` and
-        # slice it off, keeping memory/work linear in `num_tokens + num_cells`.
-        dest_idx = torch.where(in_bounds, flat_idx, num_cells)
-        draft_buf = torch.full(
-            (num_cells + 1,),
+        cells = torch.arange(
+            num_cells, dtype=torch.int64, device=state_table.device
+        ).unsqueeze(1)
+        cell_match = in_bounds.unsqueeze(0) & (cells == flat_idx.unsqueeze(0))
+        any_cell = cell_match.any(dim=1)
+        draft_grid = torch.where(
+            any_cell,
+            torch.where(cell_match, draft_i32.unsqueeze(0), _AMAX_SENTINEL).amax(dim=1),
             NO_FORCED_TOKEN,
-            dtype=torch.int32,
-            device=state_table.device,
-        )
-        draft_grid = draft_buf.scatter(
-            0, dest_idx, torch.where(in_bounds, draft_i32, no_tok)
-        )[:num_cells].reshape(num_reqs, max_draft_tokens)
+        ).reshape(num_reqs, max_draft_tokens)
 
         no_req_tok = torch.full(
             (num_reqs,), NO_FORCED_TOKEN, dtype=torch.int32, device=state_table.device
@@ -908,23 +850,6 @@ class ThinkingBudgetTracker:
         self._free_slots: list[int] = list(range(self._capacity - 1, 0, -1))
         self._dirty_states: dict[str, StateTuple] = {}
         self._state_table: torch.Tensor | None = None
-        self._slot_upload_cache: dict[
-            tuple[torch.device, int, int], tuple[bytes, torch.Tensor]
-        ] = {}
-        self._state_epoch: int = 0
-        self._prepared_key: tuple[int, int, tuple[str | None, ...]] | None = None
-        self._prepared_has_tracked: bool = False
-        self._chunk_fast_cache: dict[
-            tuple[
-                int,
-                torch.device,
-                int,
-                int,
-                tuple[str | None, ...],
-                frozenset[str],
-            ],
-            torch.Tensor | None,
-        ] = {}
 
     @property
     def enabled(self) -> bool:
@@ -945,11 +870,6 @@ class ThinkingBudgetTracker:
     def __bool__(self) -> bool:
         return self._markers is not None and bool(self._budgets)
 
-    def _bump_epoch(self) -> None:
-        self._state_epoch += 1
-        self._prepared_key = None
-        self._chunk_fast_cache.clear()
-
     def commit_state_table(self, state_table: torch.Tensor) -> None:
         self._state_table = state_table
 
@@ -965,40 +885,28 @@ class ThinkingBudgetTracker:
             )
             table[:, COL_BUDGET] = -1
             self._state_table = table.to(device)
-            self._slot_upload_cache.clear()
-            self._bump_epoch()
         return self._state_table
 
     def _release_slot(self, req_id: str) -> None:
         slot = self._slot_by_req_id.pop(req_id, None)
         if slot is not None:
             self._free_slots.append(slot)
-            self._bump_epoch()
 
     def discard(self, req_ids: Iterable[str]) -> None:
         if not self._budgets:
             return
-        changed = False
         for req_id in req_ids:
-            if self._budgets.pop(req_id, None) is not None:
-                changed = True
-            if self._dirty_states.pop(req_id, None) is not None:
-                changed = True
+            self._budgets.pop(req_id, None)
+            self._dirty_states.pop(req_id, None)
             self._release_slot(req_id)
-        if changed:
-            self._bump_epoch()
 
     def on_preempted(self, req_ids: Iterable[str] | None) -> None:
         if not req_ids or not self._budgets:
             return
-        changed = False
         for req_id in req_ids:
             if req_id in self._budgets:
-                if self._dirty_states.pop(req_id, None) is not None:
-                    changed = True
+                self._dirty_states.pop(req_id, None)
                 self._release_slot(req_id)
-        if changed:
-            self._bump_epoch()
 
     def add(
         self,
@@ -1024,7 +932,6 @@ class ThinkingBudgetTracker:
         self._dirty_states[req_id] = compute_sequence_state(
             prompt_token_ids or (), clamped_budget, self._markers
         )
-        self._bump_epoch()
 
     def needs_output_reseed(
         self,
@@ -1069,7 +976,6 @@ class ThinkingBudgetTracker:
     ) -> None:
         if self._markers is None or not self._budgets:
             return
-        changed = False
         for req_id in resumed_req_ids:
             budget = self._budgets.get(req_id)
             req_state = None if budget is None else requests.get(req_id)
@@ -1078,9 +984,6 @@ class ThinkingBudgetTracker:
             self._dirty_states[req_id] = _compute_request_state(
                 req_state, budget, self._markers
             )
-            changed = True
-        if changed:
-            self._bump_epoch()
 
     def _allocate_slot(self, req_id: str) -> int:
         existing = self._slot_by_req_id.get(req_id)
@@ -1092,7 +995,6 @@ class ThinkingBudgetTracker:
         )
         slot = self._free_slots.pop()
         self._slot_by_req_id[req_id] = slot
-        self._bump_epoch()
         return slot
 
     def prepare_step(
@@ -1104,26 +1006,14 @@ class ThinkingBudgetTracker:
         """Ensure all scheduled budgeted requests own seeded slots on ``device``."""
         if self._markers is None or not self._budgets:
             return None
-        batch_tuple = tuple(batch_req_ids)
-        prep_key = (self._state_epoch, len(requests), batch_tuple)
-        if (
-            not self._dirty_states
-            and self._state_table is not None
-            and self._prepared_key == prep_key
-            and _same_target_device(self._state_table.device, device)
-        ):
-            return self._state_table if self._prepared_has_tracked else None
-
         batch_tracked = list(
             dict.fromkeys(
                 req_id
-                for req_id in batch_tuple
+                for req_id in batch_req_ids
                 if req_id is not None and req_id in self._budgets
             )
         )
         if not batch_tracked:
-            self._prepared_key = (self._state_epoch, len(requests), batch_tuple)
-            self._prepared_has_tracked = False
             return None
 
         if requests:
@@ -1164,8 +1054,6 @@ class ThinkingBudgetTracker:
                     torch.from_numpy(vals_np).to(device),
                 )
             self._state_table = state_table
-        self._prepared_key = (self._state_epoch, len(requests), batch_tuple)
-        self._prepared_has_tracked = True
         return state_table
 
     def build_chunk_slot_ids(
@@ -1175,84 +1063,31 @@ class ThinkingBudgetTracker:
         start_idx: int,
         end_idx: int,
         padded_num_reqs: int,
-        discard_req_ids: AbstractSet[str] | Callable[[str], bool] | None = None,
+        discard_req_ids: AbstractSet[str] | None = None,
     ) -> torch.Tensor | None:
         """Build ``[padded_num_reqs]`` int32 slot IDs for ``[start_idx, end_idx)``."""
-        canon_dev = (
-            self._state_table.device
-            if self._state_table is not None
-            and _same_target_device(self._state_table.device, device)
-            else device
-        )
         upper = min(end_idx, len(batch_req_ids), start_idx + padded_num_reqs)
-        use_set = not callable(discard_req_ids)
-        fast_key = None
-        if use_set:
-            chunk_ids = tuple(batch_req_ids[start_idx:upper])
-            disc_set = (
-                frozenset(
-                    r for r in chunk_ids if r is not None and r in discard_req_ids
-                )
-                if discard_req_ids
-                else frozenset()
-            )
-            fast_key = (
-                self._state_epoch,
-                canon_dev,
-                padded_num_reqs,
-                start_idx,
-                chunk_ids,
-                disc_set,
-            )
-            if fast_key in self._chunk_fast_cache:
-                return self._chunk_fast_cache[fast_key]
-
         slots_np = np.zeros(padded_num_reqs, dtype=np.int32)
         seen_slots: set[int] = set()
         any_active = False
         for batch_i in range(start_idx, upper):
-            local_i = batch_i - start_idx
             req_id = batch_req_ids[batch_i]
             if req_id is None:
                 continue
             slot = self._slot_by_req_id.get(req_id)
-            if slot is None:
-                continue
-            if discard_req_ids is not None and (
-                discard_req_ids(req_id)
-                if callable(discard_req_ids)
-                else req_id in discard_req_ids
+            if slot is None or (
+                discard_req_ids is not None and req_id in discard_req_ids
             ):
                 continue
             assert slot not in seen_slots, (
                 f"Duplicate slot {slot} for req_id={req_id!r} in chunk"
             )
             seen_slots.add(slot)
-            slots_np[local_i] = slot
+            slots_np[batch_i - start_idx] = slot
             any_active = True
         if not any_active:
-            if fast_key is not None:
-                if len(self._chunk_fast_cache) >= _MAX_SLOT_UPLOAD_CACHE:
-                    self._chunk_fast_cache.clear()
-                self._chunk_fast_cache[fast_key] = None
             return None
-        cache_key = (canon_dev, padded_num_reqs, start_idx)
-        payload = slots_np.tobytes()
-        cached = self._slot_upload_cache.get(cache_key)
-        if cached is not None and cached[0] == payload:
-            dev_slots = cached[1]
-        else:
-            if len(self._slot_upload_cache) >= _MAX_SLOT_UPLOAD_CACHE:
-                self._slot_upload_cache.clear()
-            # Synchronous .to(device) avoids unfenced async H2D reads; caching
-            # skips redundant H2D copies across steady-state decode steps.
-            dev_slots = torch.from_numpy(slots_np).to(device)
-            self._slot_upload_cache[cache_key] = (payload, dev_slots)
-        if fast_key is not None:
-            if len(self._chunk_fast_cache) >= _MAX_SLOT_UPLOAD_CACHE:
-                self._chunk_fast_cache.clear()
-            self._chunk_fast_cache[fast_key] = dev_slots
-        return dev_slots
+        return torch.from_numpy(slots_np).to(device)
 
     def precompile(
         self,
