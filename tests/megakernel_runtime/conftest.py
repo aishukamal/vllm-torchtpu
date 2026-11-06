@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,6 +24,8 @@ from pathlib import Path
 import pytest
 
 from tests.megakernel.conftest import register_megakernel_cpu_plugin
+
+_RUNTIME = "vllm_torchtpu.megakernel_runtime."
 
 # A built-in shorthand for tests: a stdlib-only template package on a temp
 # path, entered in `plugin.SHORTHANDS` (the table itself may be empty).
@@ -41,6 +44,20 @@ SPEC = TpuMonoSpec(
 
 def pytest_configure(config: pytest.Config) -> None:
     register_megakernel_cpu_plugin(config)
+
+
+@pytest.fixture(autouse=True)
+def _std_megakernel_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route the lazy vLLM loggers of the imported runtime modules to
+    `logging` when vLLM is absent (CPU)."""
+    for name in sorted(n for n in sys.modules if n.startswith(_RUNTIME)):
+        lazy = getattr(sys.modules[name], "logger", None)
+        if not callable(getattr(lazy, "_resolve", None)):
+            continue
+        try:
+            lazy._resolve()
+        except ModuleNotFoundError:
+            monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
 
 
 @pytest.fixture
