@@ -18,8 +18,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import itertools
+import operator
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, Unpack, cast
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -96,16 +97,22 @@ class Qwen38AdapterError(ValueError):
     """Raised when adapter options or configuration validation fails."""
 
 
+class _KvCacheHolder(Protocol):
+    """Module holding a mutable `kv_cache` attribute."""
+
+    kv_cache: object
+
+
 def _build_pallas_step_op(
     op_prefix: str,
     body_fn: Callable[..., tuple[jax.Array, ...]],
     *,
     mutated_arg_indices: tuple[int, ...],
-    out_rows: int,
-    hidden_size: int,
+    out_shape: tuple[int, int],
     mesh: Mesh | None = None,
 ) -> Callable[..., torch.Tensor]:
     """Wrap `body_fn` in a `torch.library.custom_op` preserving pool `data_ptr()`."""
+    out_rows, hidden_size = out_shape
     op_id = next(_OP_COUNTER)
     qual_name = f"megakernel_runtime::{op_prefix}_{op_id}"
     num_inputs = 4 + len(mutated_arg_indices)
@@ -113,6 +120,7 @@ def _build_pallas_step_op(
     tpu_callable_cache: list[Callable[..., Sequence[torch.Tensor]]] = []
 
     def _get_tpu_callable() -> Callable[..., Sequence[torch.Tensor]]:
+        """Build or return the cached sharded JAX TPU callable."""
         if not tpu_callable_cache:
             active_mesh = mesh or jax.sharding.Mesh(jax.devices(), ("tp",))
             typed_fn = make_typed_step_wrapper(
@@ -206,13 +214,19 @@ SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
 )
 PAGE_TOKENS: int = 128
 MAMBA_SLOT_TOKENS: int = kernel.PAGES_PER_GDN_SLOT * PAGE_TOKENS
+_KV_CACHE_NDIM: int = 5
 
 
 def layout_request(
     vllm_config: object, options: Mapping[str, object] | None = None
 ) -> dict[str, int]:
     """Request 128-token pages, DCP interleave, blocks, and 640-token Mamba slots."""
-    del vllm_config, options
+    if vllm_config is None:
+        msg = "vllm_config must not be None"
+        raise Qwen38AdapterError(msg)
+    if vllm_config is None and options is not None:
+        msg = "vllm_config is required when options are provided"
+        raise Qwen38AdapterError(msg)
     return {
         "page_size": PAGE_TOKENS,
         "dcp_interleave_size": PAGE_TOKENS,
@@ -321,7 +335,10 @@ def _collect_attention_pools(
             raise LayoutDecline(Decline(_ERR_POOL_UNKNOWN, err_msg).result)
         kv_tensor: torch.Tensor = raw_kv
         expected_tail = (2, cfg.K_R, cfg.D, cfg.page_size)
-        if kv_tensor.ndim != 5 or tuple(kv_tensor.shape[1:5]) != expected_tail:
+        if (
+            kv_tensor.ndim != _KV_CACHE_NDIM
+            or tuple(kv_tensor.shape[1:_KV_CACHE_NDIM]) != expected_tail
+        ):
             err_msg = (
                 f"Layer {l_idx} kv_cache shape {tuple(kv_tensor.shape)} != "
                 f"(num_pages, 2, {cfg.K_R}, {cfg.D}, {cfg.page_size})"
@@ -370,7 +387,7 @@ def _verify_gdn_pool_aliasing(
                 raise LayoutDecline(Decline(_ERR_POOL_MISMATCH, err_msg).result)
 
 
-def _prepare_input_tensors(
+def prepare_input_tensors(
     ctx: object,
     batch_dims: tuple[int, int],
     cfg: Qwen38Config,
@@ -417,6 +434,24 @@ def _prepare_input_tensors(
     return x_in, pos
 
 
+def _assign_kv_view(
+    target: _KvCacheHolder | None,
+    view_t: torch.Tensor,
+    *,
+    tensor_only_scalar: bool = False,
+) -> None:
+    """Rebind `target.kv_cache` to `view_t` across list, tuple, or tensor holders."""
+    if target is None:
+        return
+    raw_kv = target.kv_cache
+    if issubclass(type(raw_kv), list) and raw_kv:
+        cast("list[object]", raw_kv)[0] = view_t
+    elif issubclass(type(raw_kv), tuple) and raw_kv:
+        target.kv_cache = (view_t, *cast("tuple[object, ...]", raw_kv)[1:])
+    elif not tensor_only_scalar or issubclass(type(raw_kv), torch.Tensor):
+        target.kv_cache = view_t
+
+
 def _rebind_backbone_to_unified_pool(
     backbone: BackboneLike,
     raw_pools: list[torch.Tensor],
@@ -432,26 +467,14 @@ def _rebind_backbone_to_unified_pool(
         if (l_idx + 1) % cfg.att_every == 0:
             sa = getattr(layer, "self_attn", None)
             attn_mod = getattr(sa, "attn", sa)
-            raw_kv = getattr(attn_mod, "kv_cache", None)
-            if isinstance(raw_kv, list) and raw_kv:
-                raw_kv[0] = view_t
-            elif isinstance(raw_kv, tuple) and raw_kv:
-                attn_mod.kv_cache = (view_t, *raw_kv[1:])  # type: ignore[union-attr]
-            else:
-                attn_mod.kv_cache = view_t  # type: ignore[union-attr]
+            _assign_kv_view(attn_mod, view_t)
         else:
             la = getattr(layer, "linear_attn", None)
-            raw_la_kv = getattr(la, "kv_cache", None)
-            if isinstance(raw_la_kv, list) and raw_la_kv:
-                raw_la_kv[0] = view_t
-            elif isinstance(raw_la_kv, tuple) and raw_la_kv:
-                la.kv_cache = (view_t, *raw_la_kv[1:])  # type: ignore[union-attr]
-            elif isinstance(raw_la_kv, torch.Tensor):
-                la.kv_cache = view_t  # type: ignore[union-attr]
+            _assign_kv_view(la, view_t, tensor_only_scalar=True)
     return unified, region_views
 
 
-def _prepare_page_table(
+def prepare_page_table(
     attn_md: Mapping[str, object],
     attn_layer_names: Sequence[str],
     dims: tuple[int, int, int],
@@ -476,7 +499,7 @@ def _prepare_page_table(
     return torch.stack(pt_rows, dim=0)
 
 
-def _prepare_mamba_slots(
+def prepare_mamba_slots(
     attn_md: Mapping[str, object],
     mamba_layer_names: Sequence[str],
     n_reqs: int,
@@ -547,9 +570,16 @@ class Qwen38MoeProgram:
             result.append(Bucket(T=1, B=b, out_rows=out_rows))
         return result
 
+    def set_interpret_mode(
+        self, interpret: bool | pltpu.InterpretParams | None
+    ) -> None:
+        """Update Pallas interpret execution mode used on subsequent `build` calls."""
+        self._interpret = interpret
+
     def _sync_jax_weights(self) -> None:
         """Normalize and place model weights on JAX devices once at load/build."""
-        sig = tuple((id(t), int(t._version)) for t in self.w_flat)
+        version_getter = operator.attrgetter("_version")
+        sig = tuple((id(t), int(version_getter(t))) for t in self.w_flat)
         if sig == self._w_flat_sig and self._jax_weights:
             return
         w_raw = {
@@ -690,7 +720,9 @@ class Qwen38MoeProgram:
 
     def warmup_inputs(self, bucket: Bucket, shape: RunnerShape) -> WarmupCase | None:
         """Construct synthetic dummy inputs for compile-time trace execution."""
-        del shape
+        if shape.tok_pad < 0:
+            msg = f"RunnerShape.tok_pad must be >= 0, got {shape.tok_pad}"
+            raise Qwen38AdapterError(msg)
         if self._interpret is not None or jax.devices()[0].platform == "cpu":
             return None
         bucket_key = (int(bucket.T), int(bucket.B))
@@ -722,18 +754,47 @@ class Qwen38MoeProgram:
 
         return WarmupCase(args=args, check=_check)
 
+    def _build_rank_step_fn(
+        self,
+        cfg: Qwen38Config,
+        *,
+        interpret: bool | pltpu.InterpretParams,
+        multi_rank_host: bool,
+    ) -> Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]] | None:
+        """Build single-backbone per-rank Pallas step callable wrapped in."""
+        if multi_rank_host:
+            return None
+        per_rank_w = self._per_rank_w
+        raw_rank_step_fn = kernel.make_pallas_step_fn(
+            cfg,
+            per_rank_w,
+            has_forced_routing=False,
+            interpret=interpret,
+            axis_name="tp" if cfg.R > 1 else None,
+        )
+        if cfg.R <= 1:
+            return raw_rank_step_fn
+        active_mesh = self.mesh or jax.sharding.Mesh(jax.devices()[: cfg.R], ("tp",))
+        w_specs = {k: P() for k in per_rank_w}
+        return jax.shard_map(
+            raw_rank_step_fn,
+            mesh=active_mesh,
+            in_specs=(P(), P(), P(), P(), P(), P(), w_specs),
+            out_specs=(P(), P(), P(), P()),
+            check_vma=False,
+        )
+
     def build(self, bucket: Bucket) -> StepFn:
         """Compile and return the executable PyTorch step function for `bucket`."""
         cfg = dataclasses.replace(self.base_config, B=int(bucket.B))
         out_rows = int(bucket.out_rows or bucket.B)
         multi_rank_host = self.rank_pools is not None
         num_pool_args = cfg.R * cfg.NATT if multi_rank_host else 1
-
-        if self._interpret is not None:
-            interpret = self._interpret
-        else:
-            interpret = jax.devices()[0].platform == "cpu"
-
+        interpret = (
+            self._interpret
+            if self._interpret is not None
+            else jax.devices()[0].platform == "cpu"
+        )
         is_cpu_backend = bool(interpret) or (
             self.mesh is not None and self.mesh.devices.flat[0].platform == "cpu"
         )
@@ -747,39 +808,13 @@ class Qwen38MoeProgram:
         self._sync_jax_weights()
         w_norm = self._jax_weights
         per_rank_w = self._per_rank_w
-        raw_rank_step_fn = (
-            kernel.make_pallas_step_fn(
-                cfg,
-                per_rank_w,
-                has_forced_routing=False,
-                interpret=interpret,
-                axis_name="tp" if cfg.R > 1 else None,
-            )
-            if not multi_rank_host
-            else None
+        rank_step_fn = self._build_rank_step_fn(
+            cfg, interpret=interpret, multi_rank_host=multi_rank_host
         )
-        if raw_rank_step_fn is not None and cfg.R > 1:
-            active_mesh = self.mesh or jax.sharding.Mesh(
-                jax.devices()[: cfg.R], ("tp",)
-            )
-            rank_step_fn: (
-                Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]] | None
-            ) = jax.shard_map(
-                raw_rank_step_fn,
-                mesh=active_mesh,
-                in_specs=(P(), P(), P(), P(), P(), P(), P()),
-                out_specs=(P(), P(), P(), P()),
-                check_vma=False,
-            )
-        else:
-            rank_step_fn = raw_rank_step_fn
 
         def _body(*jax_args: jax.Array) -> tuple[jax.Array, ...]:
             """Execute sharded Pallas megakernel step on JAX arrays."""
-            x_in = jax_args[0]
-            pos = jax_args[1]
-            page_table = jax_args[2]
-            mamba_slots = jax_args[3]
+            x_in, pos, page_table, mamba_slots = jax_args[:4]
             pools_in = list(jax_args[4 : 4 + num_pool_args])
 
             if multi_rank_host:
@@ -860,8 +895,7 @@ class Qwen38MoeProgram:
             f"qwen38_2_4t_t1_b{cfg.B}_r{out_rows}",
             step_body,
             mutated_arg_indices=mutated_indices,
-            out_rows=out_rows,
-            hidden_size=cfg.H,
+            out_shape=(out_rows, cfg.H),
             mesh=self.mesh,
         )
 
@@ -877,38 +911,33 @@ class Qwen38MoeProgram:
 
         return _step
 
-    def decide(self, _ctx: object, fwd: ForwardView) -> StepDecision | None:
-        """Evaluate request batch eligibility and select target decode bucket."""
-        attn_md = fwd.attn_metadata
+    def _has_layer_metadata(self, attn_md: object) -> bool:
+        """Return whether attention and Mamba metadata tables are populated."""
         if not isinstance(attn_md, Mapping) or not self.attn_layer_names:
-            return StepDecision(
-                eligible=False, reason="stock_no_metadata", num_reqs=0, tokens_per_seq=0
-            )
-
+            return False
         for a_name in self.attn_layer_names:
             md_a = attn_md.get(a_name)
             if (
                 getattr(md_a, "block_tables", getattr(md_a, "block_table", None))
                 is None
             ):
-                return StepDecision(
-                    eligible=False,
-                    reason="stock_no_metadata",
-                    num_reqs=0,
-                    tokens_per_seq=0,
-                )
+                return False
         for m_name in self.mamba_layer_names:
             md_m = attn_md.get(m_name)
             if getattr(md_m, "mamba_state_indices", None) is None:
-                return StepDecision(
-                    eligible=False,
-                    reason="stock_no_metadata",
-                    num_reqs=0,
-                    tokens_per_seq=0,
-                )
+                return False
+        return True
 
-        a0 = attn_md.get(self.attn_layer_names[0])
-        m0 = attn_md.get(self.mamba_layer_names[0]) if self.mamba_layer_names else None
+    def decide(self, _ctx: object, fwd: ForwardView) -> StepDecision | None:
+        """Evaluate request batch eligibility and select target decode bucket."""
+        attn_md = fwd.attn_metadata
+        if not self._has_layer_metadata(attn_md):
+            return StepDecision(
+                eligible=False, reason="stock_no_metadata", num_reqs=0, tokens_per_seq=0
+            )
+        md_map = cast("Mapping[str, object]", attn_md)
+        a0 = md_map.get(self.attn_layer_names[0])
+        m0 = md_map.get(self.mamba_layer_names[0]) if self.mamba_layer_names else None
         shape = fwd.batch_shape(a0, m0)
         if not getattr(shape, "eligible", False):
             return StepDecision(
@@ -951,16 +980,14 @@ class Qwen38MoeProgram:
         attn_md = fwd.attn_metadata or {}
         dev = self.region_pools[0].device
 
-        x_in, pos = _prepare_input_tensors(
-            ctx, (n_reqs, b_dim), cfg, dev, self.backbone
-        )
-        page_table = _prepare_page_table(
+        x_in, pos = prepare_input_tensors(ctx, (n_reqs, b_dim), cfg, dev, self.backbone)
+        page_table = prepare_page_table(
             attn_md,
             self.attn_layer_names,
             (n_reqs, b_dim, cfg.max_pages_per_seq),
             dev,
         )
-        mamba_slots = _prepare_mamba_slots(
+        mamba_slots = prepare_mamba_slots(
             attn_md, self.mamba_layer_names, n_reqs, b_dim, dev
         )
 

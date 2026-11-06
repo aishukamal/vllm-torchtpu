@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
 import multiprocessing
@@ -27,7 +28,7 @@ import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-import pytest  # pyrefly: ignore[missing-import]
+import pytest
 import torch
 from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 
@@ -60,15 +61,12 @@ oracle = importlib.import_module("oracle_fp64")
 
 @pytest.fixture(autouse=True)
 def _mock_uninitialized_distributed(monkeypatch: pytest.MonkeyPatch) -> None:
-    import contextlib
-
+    """Stub uninitialized vLLM TP rank getters to return rank 0 during unit tests."""
     with contextlib.suppress(Exception):
-        import vllm.distributed.parallel_state as ps
-
-        if ps._TP is None:
+        ps = importlib.import_module("vllm.distributed.parallel_state")
+        if vars(ps).get("_TP") is None:
             monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda: 0)
-            import vllm.distributed as dist_mod
-
+            dist_mod = importlib.import_module("vllm.distributed")
             monkeypatch.setattr(dist_mod, "get_tensor_model_parallel_rank", lambda: 0)
 
 
@@ -236,8 +234,14 @@ def test_qwen38_spec_is_stdlib_only_and_shorthand_resolves() -> None:
         assert summary["fits_in_limit"] is True
         assert summary["fits_in_scalar_limit"] is True
 
-    # Verify adapter.create declines on mismatched head/expert geometry fields (S4-M1).
     adapter_mod = importlib.import_module(f"{_PKG}.adapter")
+    _assert_qwen38_decline_cases(adapter_mod)
+    _verify_adapter_create_92l(adapter_mod)
+
+
+def _assert_qwen38_decline_cases(adapter_mod: object) -> None:
+    """Verify `adapter.create` declines on mismatched geometry or quantization."""
+    create_fn = vars(adapter_mod)["create"]
     bad_hf = SimpleNamespace(
         architectures=["Qwen3_5MoeForCausalLM"],
         model_type="qwen3_5_moe_text",
@@ -248,7 +252,7 @@ def test_qwen38_spec_is_stdlib_only_and_shorthand_resolves() -> None:
     )
     r_bad_geom = testing.fake_runner(hf_config=bad_hf, tp_size=32)
     r_bad_geom.parallel_config.decode_context_parallel_size = 8
-    res_bad_geom = adapter_mod.create(RunnerView(r_bad_geom, tp_rank=0), {})
+    res_bad_geom = create_fn(RunnerView(r_bad_geom, tp_rank=0), {})
     assert isinstance(res_bad_geom, Decline)
     assert res_bad_geom.code == "unsupported_geometry"
 
@@ -262,11 +266,9 @@ def test_qwen38_spec_is_stdlib_only_and_shorthand_resolves() -> None:
         )
         r_bad_q = testing.fake_runner(hf_config=unquant_hf, tp_size=32)
         r_bad_q.parallel_config.decode_context_parallel_size = 8
-        res_bad_q = adapter_mod.create(RunnerView(r_bad_q, tp_rank=0), {})
+        res_bad_q = create_fn(RunnerView(r_bad_q, tp_rank=0), {})
         assert isinstance(res_bad_q, Decline)
         assert res_bad_q.code == "unsupported_quant"
-
-    _verify_adapter_create_92l(adapter_mod)
 
 
 def test_qwen38_load_tensor_and_layout_request_hooks() -> None:
@@ -285,7 +287,7 @@ def test_qwen38_load_tensor_and_layout_request_hooks() -> None:
     }
     assert vcfg.cache_config.block_size == _EXPECTED_BLOCK_SIZE
     assert (
-        vcfg._megakernel_layout_applied["mamba_slot_tokens"]
+        vars(vcfg)["_megakernel_layout_applied"]["mamba_slot_tokens"]
         == _EXPECTED_MAMBA_SLOT_TOKENS
     )
 
@@ -593,16 +595,12 @@ def _execute_qwen38_cpu_e2e_test() -> None:
 
 def _patch_uninitialized_tp_rank() -> None:
     """Stub uninitialized vLLM TP rank getters in standalone CPU worker processes."""
-    import contextlib
-
     with contextlib.suppress(Exception):
-        import vllm.distributed.parallel_state as ps
-
-        if ps._TP is None:
-            ps.__dict__["get_tensor_model_parallel_rank"] = lambda: 0
-            import vllm.distributed as dist_mod
-
-            dist_mod.__dict__["get_tensor_model_parallel_rank"] = lambda: 0
+        ps = importlib.import_module("vllm.distributed.parallel_state")
+        if vars(ps).get("_TP") is None:
+            vars(ps)["get_tensor_model_parallel_rank"] = lambda: 0
+            dist_mod = importlib.import_module("vllm.distributed")
+            vars(dist_mod)["get_tensor_model_parallel_rank"] = lambda: 0
 
 
 def _run_qwen38_cpu_parity_worker() -> None:
@@ -642,32 +640,10 @@ def test_qwen38_cpu_e2e_parity_and_zero_weight_negative_control(
     _execute_qwen38_cpu_e2e_test()
 
 
-def test_qwen38_multi_region_l8_and_single_backbone() -> None:
-    """Verify 2-region L=8 KV pools and single-backbone execution."""
-    shapes = importlib.import_module(f"{_PKG}.shapes")
-    adapter_mod = importlib.import_module(f"{_PKG}.adapter")
-    kernel_mod = importlib.import_module(f"{_PKG}.kernel")
-    weights_mod = importlib.import_module(f"{_PKG}.weights")
-    weights_mod.clear_observed_weights()
-
-    # 2-region L=8 (NATT=2, NGDN=6) on R=1, TP=1, DCP=1, hier_group=1:
-    # exercises multi-region KV pools with identical physical page_table IDs,
-    # shared mamba_slots across all 6 GDN layers, padded batch row (-1) masking,
-    # DCP=1 guard, and single-backbone execution (multi_rank_host=False).
-    cfg_l8 = dataclasses.replace(
-        shapes.mini_parity_config(batch_size=4),
-        R=1,
-        DCP=1,
-        hier_group=1,
-        Q_H=4,
-        KV_H=1,
-        KH=1,
-        VH=2,
-        L=8,
-        E=4,
-        K=2,
-        h_tile=64,
-    )
+def _build_l8_problem_and_runner(
+    cfg_l8: Qwen38Config,
+) -> tuple[dict[str, Any], np.ndarray, dict[str, np.ndarray], Any, Any]:
+    """Construct synthetic 2-region `L=8` problem, FP64 reference, and runner."""
     prob_l8 = oracle.make_synthetic_problem(
         cfg_l8,
         seed=99,
@@ -717,6 +693,34 @@ def test_qwen38_multi_region_l8_and_single_backbone() -> None:
     )
     runner_single.parallel_config.decode_context_parallel_size = 8
     runner_single.vllm_config.parallel_config.decode_context_parallel_size = 8
+    return prob_l8, pt_l8_np, ref_l8, mock_l8, runner_single
+
+
+def test_qwen38_multi_region_l8_and_single_backbone() -> None:
+    """Verify 2-region L=8 KV pools and single-backbone execution."""
+    shapes = importlib.import_module(f"{_PKG}.shapes")
+    adapter_mod = importlib.import_module(f"{_PKG}.adapter")
+    kernel_mod = importlib.import_module(f"{_PKG}.kernel")
+    weights_mod = importlib.import_module(f"{_PKG}.weights")
+    weights_mod.clear_observed_weights()
+
+    cfg_l8 = dataclasses.replace(
+        shapes.mini_parity_config(batch_size=4),
+        R=1,
+        DCP=1,
+        hier_group=1,
+        Q_H=4,
+        KV_H=1,
+        KH=1,
+        VH=2,
+        L=8,
+        E=4,
+        K=2,
+        h_tile=64,
+    )
+    prob_l8, pt_l8_np, ref_l8, mock_l8, runner_single = _build_l8_problem_and_runner(
+        cfg_l8
+    )
 
     prog = adapter_mod.Qwen38MoeProgram(
         mock_l8.model,
@@ -840,7 +844,7 @@ def test_qwen38_multi_region_l8_and_single_backbone() -> None:
     # Negative control: scaling final_norm by -4.0 must trigger _sync_jax_weights
     # and scale the output by -4.0.
     out_l8_orig = out_l8.detach().to(torch.float32).clone()
-    prog._interpret = True
+    prog.set_interpret_mode(True)
     prog.w_flat[-1] = prog.w_flat[-1] * -4.0
     step_fn_bad = prog.build(Bucket(1, 4))
     fwd_l8_bad = ForwardView(
@@ -904,7 +908,7 @@ def test_qwen38_prepare_input_tensors_fail_closed_missing_embed() -> None:
         RuntimeError,
         match="Model is missing callable embed_tokens required to embed input_ids",
     ):
-        adapter_mod._prepare_input_tensors(
+        adapter_mod.prepare_input_tensors(
             ctx, (2, 2), cfg, torch.device("cpu"), backbone_no_embed
         )
 
@@ -917,7 +921,7 @@ def test_qwen38_prepare_input_tensors_fail_closed_missing_embed() -> None:
         RuntimeError,
         match="StepContext is missing required positions tensor",
     ):
-        adapter_mod._prepare_input_tensors(
+        adapter_mod.prepare_input_tensors(
             ctx_no_pos, (2, 2), cfg, torch.device("cpu"), backbone_no_embed
         )
 
@@ -925,7 +929,7 @@ def test_qwen38_prepare_input_tensors_fail_closed_missing_embed() -> None:
         RuntimeError,
         match="Missing block_table in attention metadata",
     ):
-        adapter_mod._prepare_page_table(
+        adapter_mod.prepare_page_table(
             {}, ["model.layers.3.self_attn.attn"], (2, 2, 4), torch.device("cpu")
         )
 
@@ -933,6 +937,6 @@ def test_qwen38_prepare_input_tensors_fail_closed_missing_embed() -> None:
         RuntimeError,
         match="Missing mamba_state_indices in attention metadata",
     ):
-        adapter_mod._prepare_mamba_slots(
+        adapter_mod.prepare_mamba_slots(
             {}, ["model.layers.0.linear_attn"], 2, 2, torch.device("cpu")
         )

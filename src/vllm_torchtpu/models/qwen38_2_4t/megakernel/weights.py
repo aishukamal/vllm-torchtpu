@@ -62,6 +62,8 @@ if TYPE_CHECKING:
         mlp: _MlpSublayerLike
 
     class BackboneLike(Protocol):
+        """Structural protocol for a Qwen3.8 decoder backbone."""
+
         layers: Sequence[_DecoderLayerLike]
         norm: _WeightHolder
 

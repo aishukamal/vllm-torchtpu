@@ -387,12 +387,15 @@ def _compute_dcp_attention_scores(
         def _page_body(
             lp: jax.Array,
             carry: tuple[jax.Array, jax.Array, jax.Array],
-            b_idx: int = b,
-            n_pages: jax.Array = n_pages_b,
-            pos_val: jax.Array = pos_b,
-            q_val: jax.Array = q_b,
+            page_ctx: tuple[int, jax.Array, jax.Array, jax.Array] = (
+                b,
+                n_pages_b,
+                pos_b,
+                q_b,
+            ),
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             """Update online softmax state for one local DCP page."""
+            b_idx, n_pages, pos_val, q_val = page_ctx
             m_cur, l_cur, acc_cur = carry
             slot = lp & 1
             nxt_slot = 1 - slot
@@ -823,13 +826,13 @@ def _unpack_kernel_args(
         x_in_ref,
         pos_ref,
         page_table_ref,
-        cast(dict[str, jax.Array], w_refs),
+        cast("dict[str, jax.Array]", w_refs),
         forced_ref,
         x_out_ref,
         pool_out_ref,
         conv_out_ref,
         rec_out_ref,
-        cast(dict[str, jax.Array], scratch),
+        cast("dict[str, jax.Array]", scratch),
     )
 
 
@@ -1419,12 +1422,33 @@ def _adapt_pool_for_kernel(
 
 def _restore_pool_from_kernel(
     pool_k: jax.Array,
+    *,
     added_natt: bool,
 ) -> jax.Array:
     """Restore original pool dimensions after kernel execution."""
     if not added_natt:
         return pool_k
     return pool_k[:, 0] if pool_k.ndim == _POOL_7D_NDIM else pool_k[0]
+
+
+def _resolve_step_mesh_and_interpret(
+    cfg: Qwen38Config,
+    mesh: Mesh | None,
+    interpret: bool | pltpu.InterpretParams | None,
+) -> tuple[Mesh, bool | pltpu.InterpretParams]:
+    """Resolve a valid `cfg.R` device mesh and default interpret flag."""
+    if mesh is None or not issubclass(type(mesh), Mesh) or len(mesh.devices) != cfg.R:
+        devices = jax.devices()
+        if len(devices) < cfg.R:
+            err_msg = (
+                f"Need at least {cfg.R} JAX devices for R={cfg.R}, found {len(devices)}"
+            )
+            raise MegakernelDeviceError(err_msg)
+        mesh = Mesh(devices[: cfg.R], ("tp",))
+    resolved_interpret = (
+        mesh.devices.flat[0].platform == "cpu" if interpret is None else interpret
+    )
+    return mesh, resolved_interpret
 
 
 def run_qwen38_dcp8_step(
@@ -1435,31 +1459,22 @@ def run_qwen38_dcp8_step(
     """Execute one 32-rank TP32xDCP8 step on CPU interpret or TPU devices."""
     use_forced_routing = options.get("use_forced_routing", True)
     return_kv_updates = options.get("return_kv_updates", True)
-    interpret = options.get("interpret")
-    mesh = options.get("mesh")
-
-    if mesh is None or not isinstance(mesh, Mesh) or len(mesh.devices) != cfg.R:
-        devices = jax.devices()
-        if len(devices) < cfg.R:
-            err_msg = (
-                f"Need at least {cfg.R} JAX devices for R={cfg.R}, found {len(devices)}"
-            )
-            raise MegakernelDeviceError(err_msg)
-        mesh = Mesh(devices[: cfg.R], ("tp",))
-    if interpret is None:
-        interpret = mesh.devices.flat[0].platform == "cpu"
+    mesh, interpret = _resolve_step_mesh_and_interpret(
+        cfg, options.get("mesh"), options.get("interpret")
+    )
 
     weights_val = problem["weights"]
     if not isinstance(weights_val, dict):
         msg = "problem['weights'] must be a dict[str, jax.Array]"
         raise TypeError(msg)
-    if weights_val["wqkv"].ndim != _NORM_WQKV_NDIM:
-        norm_weights = plan.normalize_weights_for_pallas(weights_val, cfg)
-    else:
-        norm_weights = weights_val
+    norm_weights = (
+        plan.normalize_weights_for_pallas(weights_val, cfg)
+        if weights_val["wqkv"].ndim != _NORM_WQKV_NDIM
+        else weights_val
+    )
     per_rank_w_tmpl = {k: v[0] for k, v in norm_weights.items()}
 
-    raw_pool = cast(jax.Array, problem["pool"])
+    raw_pool = cast("jax.Array", problem["pool"])
     pool_in, added_natt = _adapt_pool_for_kernel(raw_pool, cfg)
     step_fn = build_sharded_step_fn(
         cfg,
@@ -1480,17 +1495,17 @@ def run_qwen38_dcp8_step(
             return jax.device_put(np.asarray(arr), sharding)
         return jax.device_put(arr, sharding)
 
-    x_s = _put(cast(jax.Array, problem["x"]))
-    pos_arr = cast(jax.Array, problem["pos"])
+    x_s = _put(cast("jax.Array", problem["x"]))
+    pos_arr = cast("jax.Array", problem["pos"])
     pos_s = _put(pos_arr)
-    pt_s = _put(cast(jax.Array, problem["page_table"]))
+    pt_s = _put(cast("jax.Array", problem["page_table"]))
     pool_s = _put(pool_in)
-    conv_s = _put(cast(jax.Array, problem["conv"]))
-    rec_s = _put(cast(jax.Array, problem["rec"]))
+    conv_s = _put(cast("jax.Array", problem["conv"]))
+    rec_s = _put(cast("jax.Array", problem["rec"]))
     w_s = {k: _put(v) for k, v in norm_weights.items()}
 
     if use_forced_routing:
-        forced_top = cast(jax.Array, problem["forced_top_ids"])
+        forced_top = cast("jax.Array", problem["forced_top_ids"])
         forced_s = _put(forced_top)
         x_out, pool_out, conv_out, rec_out = step_fn(
             x_s, pos_s, pt_s, pool_s, conv_s, rec_s, w_s, forced_s
@@ -1506,5 +1521,5 @@ def run_qwen38_dcp8_step(
         "rec": rec_out,
     }
     if return_kv_updates:
-        out["pool"] = _restore_pool_from_kernel(pool_out, added_natt)
+        out["pool"] = _restore_pool_from_kernel(pool_out, added_natt=added_natt)
     return out

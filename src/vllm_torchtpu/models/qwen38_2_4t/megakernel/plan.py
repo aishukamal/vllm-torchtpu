@@ -29,8 +29,6 @@ from vllm_torchtpu.megakernel.profiles.default import chip_budget
 if TYPE_CHECKING:
     from .shapes import Qwen38Config
 
-SCRATCH_LIMIT_BYTES = 64 * 1024 * 1024  # 64 MiB per core
-SMEM_LIMIT_BYTES = 1024 * 1024  # 1 MiB scalar memory limit
 _PAD2_SIZE: int = 2
 _MIN_2D_NDIM: int = 2
 _MOE_WEIGHT_NDIM: int = 6
