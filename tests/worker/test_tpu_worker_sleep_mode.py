@@ -1,0 +1,401 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for TPUWorker.sleep with a fake runner on host tensors."""
+
+from itertools import cycle
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+from torch import nn
+
+from vllm_torchtpu.worker import sleep_mode
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+
+class _Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 3)
+        self.lm_head = nn.Linear(4, 3, bias=False)
+        self.lm_head.weight = self.linear.weight
+        self.register_buffer("rotary", torch.arange(6, dtype=torch.float32))
+
+
+class _Draft(nn.Module):
+    def __init__(self, shared: nn.Parameter | None = None):
+        super().__init__()
+        self.fc = nn.Linear(2, 2)
+        self.register_buffer("cos", torch.arange(4, dtype=torch.float32))
+        if shared is not None:
+            self.lm_head = nn.Linear(4, 3, bias=False)
+            self.lm_head.weight = shared
+
+
+def _snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().clone()
+        for name, tensor in list(model.named_parameters())
+        + list(model.named_buffers())
+    }
+
+
+def _worker(
+    monkeypatch,
+    kv_caches=None,
+    raw_tensors=(),
+    bundle=None,
+    layers=None,
+    model=None,
+    draft_model=None,
+    preserve=(),
+    devices=(torch.device("cpu"),),
+    memory_info=((0, 0), (1 << 40, 1 << 40)),
+):
+    """A TPUWorker over host tensors, with no device behind it.
+
+    ``memory_info`` feeds the free-bytes readings, two per sleep, repeating;
+    the default reports more freed than any plan here, so the shortfall
+    warning stays quiet unless a test asks for it.
+    """
+    monkeypatch.setattr(sleep_mode, "synchronize_device", Mock())
+    readings = cycle(memory_info)
+    monkeypatch.setattr(
+        sleep_mode, "device_memory_info", lambda devices: next(readings)
+    )
+    model = _Model() if model is None else model
+    if kv_caches is None:
+        kv_caches = [torch.ones(8, 2, 4, dtype=torch.bfloat16) for _ in range(2)]
+    worker = TPUWorker.__new__(TPUWorker)
+    worker._sleep_state = None
+    worker.devices = list(devices)
+    worker.compilation_config = SimpleNamespace(
+        static_forward_context=dict(layers or {})
+    )
+    worker.model_config = SimpleNamespace(
+        sleep_preserve_parameter_names=list(preserve),
+        enable_nccl_comm_suspend=False,
+    )
+    worker.model_runner = SimpleNamespace(
+        get_model=lambda: model,
+        drafter=SimpleNamespace(draft_model=draft_model),
+        kv_caches=list(kv_caches),
+        kv_cache_raw_tensors=list(raw_tensors),
+        _kv_cache_bundle=bundle,
+    )
+    return worker, model
+
+
+def _all_tensors(worker, model):
+    return list(dict.fromkeys(model.parameters())) + list(model.buffers()) + list(
+        worker.model_runner.kv_caches
+    )
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_sleep_records_geometry_and_drops_storage(monkeypatch, level):
+    worker, model = _worker(monkeypatch)
+    before = _all_tensors(worker, model)
+    geometry = [(tuple(t.shape), t.dtype) for t in before]
+
+    worker.sleep(level)
+
+    assert worker.is_sleeping
+    assert _all_tensors(worker, model) == before
+    assert all(t.numel() == 0 for t in before)
+    state = worker._sleep_state
+    recorded = [(r.shape, r.dtype) for r in state.weights] + [
+        (r.shape, r.dtype) for r in state.kv_cache
+    ]
+    assert sorted(map(str, recorded)) == sorted(map(str, geometry))
+    assert state.level == level
+    assert state.sleeping_tags == {"weights", "kv_cache"}
+    assert state.preserved == []
+
+
+def test_tied_weights_are_recorded_once(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    worker.sleep(2)
+    names = [r.name for r in worker._sleep_state.weights]
+    assert names == ["linear.weight", "linear.bias", "rotary"]
+
+
+def test_level1_keeps_host_copies(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    expected = _snapshot(model)
+
+    worker.sleep(1)
+    for record in worker._sleep_state.weights:
+        assert record.host is not None
+        assert record.host.device.type == "cpu"
+        torch.testing.assert_close(record.host, expected[record.name])
+
+
+def test_level2_keeps_buffers_only(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    rotary = model.rotary.clone()
+
+    worker.sleep(2)
+    hosts = {r.name: r.host for r in worker._sleep_state.weights}
+    assert hosts["linear.weight"] is None and hosts["linear.bias"] is None
+    torch.testing.assert_close(hosts["rotary"], rotary)
+
+
+def test_level2_preserved_parameters_stay_resident(monkeypatch):
+    worker, model = _worker(monkeypatch, preserve=["linear.w*", "draft.*"])
+    weight = model.linear.weight
+    expected = weight.detach().clone()
+
+    worker.sleep(2)
+    assert worker._sleep_state.preserved == ["linear.weight"]
+    assert [r.name for r in worker._sleep_state.weights] == ["linear.bias", "rotary"]
+    assert model.linear.weight is weight
+    torch.testing.assert_close(weight, expected)
+    assert model.linear.bias.numel() == 0
+
+
+def test_level1_ignores_preserve_globs(monkeypatch):
+    worker, model = _worker(monkeypatch, preserve=["linear.weight"])
+    worker.sleep(1)
+    assert worker._sleep_state.preserved == []
+    assert model.linear.weight.numel() == 0
+    assert all(r.host is not None for r in worker._sleep_state.weights)
+
+
+def test_unmatched_preserve_glob_fails_before_anything_is_released(monkeypatch):
+    worker, model = _worker(monkeypatch, preserve=["engram.*"])
+    with pytest.raises(ValueError, match="No parameter matches sleep retention"):
+        worker.sleep(2)
+    assert not worker.is_sleeping
+    assert model.linear.weight.numel() == 12
+    assert all(t.numel() == 64 for t in worker.model_runner.kv_caches)
+
+
+def test_repeated_sleep_is_a_no_op(monkeypatch):
+    worker, _ = _worker(monkeypatch)
+
+    worker.sleep(1)
+    state = worker._sleep_state
+    worker.sleep(2)
+    assert worker._sleep_state is state
+    assert state.level == 1
+
+
+def test_invalid_level_is_rejected(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    with pytest.raises(AssertionError, match="sleep level"):
+        worker.sleep(3)
+    assert not worker.is_sleeping
+    assert model.linear.weight.numel() == 12
+
+
+def test_freed_bytes_are_measured_and_must_not_be_negative(monkeypatch):
+    gib = 1 << 30
+    worker, _ = _worker(
+        monkeypatch, memory_info=[(2 * gib, 8 * gib), (5 * gib, 8 * gib)]
+    )
+    worker.sleep(2)
+    assert worker.is_sleeping
+
+    worker, _ = _worker(
+        monkeypatch, memory_info=[(5 * gib, 8 * gib), (2 * gib, 8 * gib)]
+    )
+    with pytest.raises(AssertionError, match="Memory usage increased"):
+        worker.sleep(2)
+
+
+def test_block_major_bundle_views_are_recorded_with_their_recipe(monkeypatch):
+    bundle = torch.ones(4, 3, 2, 2, dtype=torch.bfloat16)
+    views = [bundle[:, index] for index in range(3)]
+    worker, _ = _worker(monkeypatch, kv_caches=views, bundle=bundle)
+
+    worker.sleep(2)
+    assert bundle.numel() == 0
+    assert all(v.numel() == 0 for v in views)
+    [record] = worker._sleep_state.kv_cache
+    assert record.root is bundle
+    assert [v.recipe for v in record.views] == [
+        sleep_mode.SelectView(dim=1, index=index) for index in range(3)
+    ]
+
+
+def test_unified_pool_shared_by_layers_is_one_allocation(monkeypatch):
+    pool_a = torch.zeros(6, 2, 2)
+    pool_b = torch.zeros(6, 2, 2)
+    worker, _ = _worker(
+        monkeypatch, kv_caches=[pool_a, pool_a, pool_b], raw_tensors=[pool_a, pool_b]
+    )
+
+    worker.sleep(2)
+    assert [r.root for r in worker._sleep_state.kv_cache] == [pool_a, pool_b]
+    assert all(not r.views for r in worker._sleep_state.kv_cache)
+
+
+def test_unsupported_view_fails_before_anything_is_released(monkeypatch):
+    pool = torch.zeros(8, 4)
+    worker, model = _worker(monkeypatch, kv_caches=[pool[2:5, 1:3]], raw_tensors=[pool])
+
+    with pytest.raises(NotImplementedError, match="cannot rebuild"):
+        worker.sleep(2)
+    assert not worker.is_sleeping
+    assert model.linear.weight.numel() == 12
+    assert pool.numel() == 32
+
+
+def test_draft_model_is_named_and_handled_like_the_gpu_worker(monkeypatch):
+    model_shared = _Model()
+    draft = _Draft()
+    worker, model = _worker(monkeypatch, draft_model=draft)
+    cos = draft.cos.clone()
+
+    worker.sleep(2)
+    names = [r.name for r in worker._sleep_state.weights]
+    assert names == [
+        "linear.weight",
+        "linear.bias",
+        "rotary",
+        "draft.fc.weight",
+        "draft.fc.bias",
+        "draft.cos",
+    ]
+    hosts = {r.name: r.host for r in worker._sleep_state.weights}
+    assert hosts["draft.fc.weight"] is None
+    torch.testing.assert_close(hosts["draft.cos"], cos)
+    assert draft.fc.weight.numel() == 0
+
+    # A draft parameter that is the model's own object is listed once, under
+    # the model's name, so draft.* never claims it.
+    shared_draft = _Draft(shared=model_shared.linear.weight)
+    assert set(sleep_mode.sleep_parameters(model_shared, shared_draft)) == {
+        "linear.weight",
+        "linear.bias",
+        "draft.fc.weight",
+        "draft.fc.bias",
+    }
+
+
+def test_draft_preserve_glob_matches_nothing_without_a_draft(monkeypatch):
+    worker, model = _worker(monkeypatch, preserve=["draft.*"])
+    worker.sleep(2)
+    assert worker._sleep_state.preserved == []
+    assert model.linear.weight.numel() == 0
+
+    worker, _ = _worker(monkeypatch, draft_model=_Draft(), preserve=["draft.fc.*"])
+    worker.sleep(2)
+    assert worker._sleep_state.preserved == ["draft.fc.bias", "draft.fc.weight"]
+    assert worker.get_draft_model().fc.weight.numel() == 4
+
+
+def test_worker_device_without_an_index_matches_indexed_tensors():
+    on_chip = SimpleNamespace(device=torch.device("cuda", 1))
+    assert sleep_mode._on_devices(on_chip, [torch.device("cuda")])
+    assert sleep_mode._on_devices(on_chip, [torch.device("cuda", 1)])
+    assert not sleep_mode._on_devices(on_chip, [torch.device("cuda", 0)])
+    assert not sleep_mode._on_devices(on_chip, [torch.device("cpu")])
+
+
+class _SplitModel(nn.Module):
+    """Parameters on the "device" (meta stands in) and on the host."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(2, 2, device="meta")
+        self.scale = nn.Parameter(torch.ones(2))
+        self.register_buffer("table", torch.arange(3, dtype=torch.float32))
+
+
+def test_tensors_off_the_worker_devices_are_left_alone(monkeypatch):
+    worker, model = _worker(
+        monkeypatch, model=_SplitModel(), devices=[torch.device("meta")]
+    )
+    worker.sleep(2)
+    assert [r.name for r in worker._sleep_state.weights] == [
+        "linear.weight",
+        "linear.bias",
+    ]
+    assert model.linear.weight.numel() == 0
+    assert model.scale.numel() == 2 and torch.equal(model.scale, torch.ones(2))
+    assert model.table.numel() == 3
+
+    worker, model = _worker(monkeypatch, model=_SplitModel())
+    worker.sleep(1)
+    assert [r.name for r in worker._sleep_state.weights] == ["scale", "table"]
+    assert model.linear.weight.numel() == 4
+    assert model.scale.numel() == 0
+
+
+def test_layer_bound_kv_views_are_recorded(monkeypatch):
+    bundle = torch.ones(4, 3, 2, 2, dtype=torch.bfloat16)
+    views = [bundle[:, index] for index in range(3)]
+    # The layers hold their own view objects, one of them as a list, as
+    # tpu_bind_kv_cache leaves them; the runner lists hold other objects.
+    layers = {
+        "layers.0.attn": SimpleNamespace(kv_cache=bundle[:, 0]),
+        "layers.1.attn": SimpleNamespace(kv_cache=[bundle[:, 1]]),
+        "layers.2.attn": SimpleNamespace(kv_cache=torch.empty(0)),
+    }
+    worker, _ = _worker(monkeypatch, kv_caches=views, bundle=bundle, layers=layers)
+
+    worker.sleep(2)
+    bound = [layers["layers.0.attn"].kv_cache, layers["layers.1.attn"].kv_cache[0]]
+    assert all(t.numel() == 0 for t in bound)
+    [record] = worker._sleep_state.kv_cache
+    assert record.root is bundle
+    assert [v.tensor for v in record.views] == views + bound
+    assert [v.recipe for v in record.views[3:]] == [
+        sleep_mode.SelectView(dim=1, index=0),
+        sleep_mode.SelectView(dim=1, index=1),
+    ]
+
+
+def test_layer_kv_tensor_the_runner_does_not_track_fails_before_release(
+    monkeypatch,
+):
+    pool = torch.zeros(6, 2, 2)
+    stray = torch.zeros(6, 2, 2)
+    for held in (stray, stray[0]):
+        layers = {"layers.0.attn": SimpleNamespace(kv_cache=held)}
+        worker, model = _worker(
+            monkeypatch, kv_caches=[pool], raw_tensors=[pool], layers=layers
+        )
+        with pytest.raises(NotImplementedError, match="does not track"):
+            worker.sleep(2)
+        assert not worker.is_sleeping
+        assert pool.numel() == 24 and stray.numel() == 24
+        assert model.linear.weight.numel() == 12
+
+
+def test_freed_bytes_short_of_the_plan_are_reported(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    gib = 1 << 30
+    worker, _ = _worker(monkeypatch)
+    worker.sleep(2)
+    state = worker._sleep_state
+    planned = sum(r.nbytes for r in state.weights + state.kv_cache)
+    assert planned > 0
+
+    for freed, warned in ((planned, False), (planned * 0.96, False), (0, True)):
+        log = Mock()
+        monkeypatch.setattr(tpu_worker, "logger", log)
+        worker, _ = _worker(
+            monkeypatch, memory_info=[(gib, 8 * gib), (gib + int(freed), 8 * gib)]
+        )
+        worker.sleep(2)
+        assert worker.is_sleeping
+        assert log.warning.called == warned, freed
+        if warned:
+            [call] = log.warning.call_args_list
+            assert call.args[0].startswith("Sleep mode freed")
