@@ -955,7 +955,11 @@ class TPUWorker(WorkerBase):
         no weight load rewrites them), and leaves parameters matching
         ``sleep_preserve_parameter_names`` resident on device. Both levels
         free the KV cache. Every tensor object survives with zero-element
-        storage until ``wake_up``. ``enable_nccl_comm_suspend`` has no effect:
+        storage until ``wake_up``. After a level-2 wake the parameters are
+        uninitialized until the caller loads weights into them in place (an
+        RL trainer's weight update does this); the GPU worker's
+        ``reload_weights`` RPC is not implemented on TPU.
+        ``enable_nccl_comm_suspend`` has no effect:
         there is no NCCL communicator to suspend. This is a pure memory
         operation: no runtime checkpoint, no weight-transfer state. Calling
         it while already asleep is a no-op.
@@ -1031,6 +1035,43 @@ class TPUWorker(WorkerBase):
                 format_gib(planned_bytes),
                 format_gib(shortfall),
             )
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Re-allocate what ``sleep`` freed; ``weights`` before ``kv_cache``.
+
+        ``weights``: fresh device storage of the recorded shapes, with the host
+        copies written back (all tensors after level 1, buffers only after
+        level 2); after level 2 the parameters stay uninitialized until the
+        caller loads weights into them in place, as on GPU, where no
+        ``reload_weights`` RPC exists on TPU; preserved parameters were never
+        touched. ``kv_cache``: zero-filled tensors of the recorded geometry,
+        with every view (the runner's and the layers') rebuilt onto its root
+        allocation, then the KV connector's registrations restored. ``None``
+        wakes every sleeping tag. A tag that is already awake, or a call while
+        not sleeping, is a no-op.
+        """
+        state = self._sleep_state
+        if state is None:
+            logger.warning("TPU worker is not sleeping.")
+            return
+        requested = set(sleep_mode.SLEEP_TAGS) if tags is None else set(tags)
+        unknown = requested - set(sleep_mode.SLEEP_TAGS)
+        if unknown:
+            raise ValueError(
+                f"unknown wake_up tags {sorted(unknown)}; expected a subset of "
+                f"{list(sleep_mode.SLEEP_TAGS)}"
+            )
+        sleep_mode.reclaim_device_memory()
+        if "weights" in requested and "weights" in state.sleeping_tags:
+            sleep_mode.restore_weights(state.weights)
+            state.sleeping_tags.discard("weights")
+        if "kv_cache" in requested and "kv_cache" in state.sleeping_tags:
+            sleep_mode.restore_kv_cache(state.kv_cache)
+            if has_kv_transfer_group():
+                get_kv_transfer_group().restore_kv_caches()
+            state.sleeping_tags.discard("kv_cache")
+        if not state.sleeping_tags:
+            self._sleep_state = None
 
     def _kv_cache_tensors(self) -> list[torch.Tensor]:
         runner = self.model_runner

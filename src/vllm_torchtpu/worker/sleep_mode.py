@@ -270,6 +270,24 @@ def release_weights(records: Sequence[WeightRecord]) -> None:
         _release_storage(record.tensor)
 
 
+def restore_weights(records: Sequence[WeightRecord]) -> None:
+    """Give every recorded tensor fresh device storage and reinstall host copies.
+
+    Tensors without a host copy come back uninitialized; the caller loads
+    weights into them in place, as on GPU after a level-2 sleep.
+    """
+    for record in records:
+        record.tensor.data = torch.empty(
+            record.shape, dtype=record.dtype, device=record.device
+        )
+    with torch.no_grad():
+        for record in records:
+            if record.host is not None:
+                record.tensor.copy_(record.host)
+                record.host = None
+    synchronize_device()
+
+
 def _is_storage_root(tensor: torch.Tensor) -> bool:
     return (
         tensor.storage_offset() == 0
@@ -369,3 +387,15 @@ def release_kv_cache(records: Sequence[KVStorageRecord]) -> None:
         for view in record.views:
             _release_storage(view.tensor)
         _release_storage(record.root)
+
+
+def restore_kv_cache(records: Sequence[KVStorageRecord]) -> None:
+    """Re-create every KV allocation zero-filled, as ``initialize_kv_cache`` did,
+    and re-point the views at it."""
+    for record in records:
+        record.root.data = torch.zeros(
+            record.shape, dtype=record.dtype, device=record.device
+        )
+        for view in record.views:
+            view.tensor.data = view.recipe.apply(record.root)
+    synchronize_device()
