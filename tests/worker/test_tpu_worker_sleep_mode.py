@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for TPUWorker.sleep / wake_up with a fake runner on host tensors."""
+"""Tests for TPUWorker.sleep / wake_up / discard with a fake runner on host
+tensors."""
 
 from itertools import cycle
 from types import SimpleNamespace
@@ -516,3 +517,89 @@ def test_device_memory_is_reclaimed_after_release_and_before_restore(monkeypatch
     assert reclaim.call_count == 3
     worker.wake_up()
     assert reclaim.call_count == 3
+
+
+def test_discard_releases_the_kv_cache_only_and_wake_restores_it(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    expected = _snapshot(model)
+
+    worker.discard(("kv_cache",))
+    assert worker.is_sleeping
+    state = worker._sleep_state
+    assert state.level == 0 and state.sleeping_tags == {"kv_cache"}
+    assert state.weights == [] and len(state.kv_cache) == 2
+    assert all(t.numel() == 0 for t in worker.model_runner.kv_caches)
+    for name, tensor in _snapshot(model).items():
+        torch.testing.assert_close(tensor, expected[name])
+
+    worker.discard(("kv_cache",))
+    assert worker._sleep_state is state
+
+    worker.wake_up(["kv_cache"])
+    assert not worker.is_sleeping
+    for cache in worker.model_runner.kv_caches:
+        assert cache.shape == (8, 2, 4) and torch.count_nonzero(cache) == 0
+
+
+def test_discard_of_other_tags_is_rejected(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    for tags in (("weights",), ("kv_cache", "weights")):
+        with pytest.raises(RuntimeError, match="not supported on TPU"):
+            worker.discard(tags)
+    assert not worker.is_sleeping
+    assert all(t.numel() == 64 for t in worker.model_runner.kv_caches)
+    assert model.linear.weight.numel() == 12
+
+
+def test_sleep_after_discard_keeps_the_released_kv_cache_records(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    expected = _snapshot(model)
+    worker.discard(("kv_cache",))
+    kv_records = worker._sleep_state.kv_cache
+
+    worker.sleep(1)
+    state = worker._sleep_state
+    assert state.level == 1 and state.sleeping_tags == {"weights", "kv_cache"}
+    assert state.kv_cache is kv_records
+    assert model.linear.weight.numel() == 0
+
+    worker.wake_up()
+    assert not worker.is_sleeping
+    for name, tensor in _snapshot(model).items():
+        torch.testing.assert_close(tensor, expected[name])
+    assert all(c.shape == (8, 2, 4) for c in worker.model_runner.kv_caches)
+
+
+def test_sleep_after_a_partial_wake_sleeps_the_awake_tag_only(monkeypatch):
+    worker, model = _worker(monkeypatch)
+    worker.sleep(1)
+    worker.wake_up(["weights"])
+    kv_records = worker._sleep_state.kv_cache
+
+    worker.sleep(2)
+    state = worker._sleep_state
+    assert state.level == 2 and state.sleeping_tags == {"weights", "kv_cache"}
+    assert state.kv_cache is kv_records
+    assert model.linear.weight.numel() == 0
+    assert {r.name: r.host for r in state.weights}["linear.weight"] is None
+
+    worker.sleep(1)
+    assert worker._sleep_state is state and state.level == 2
+
+
+def test_kv_connector_hooks_run_once_across_discard_sleep_and_wake(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    connector = Mock()
+    monkeypatch.setattr(tpu_worker, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(tpu_worker, "get_kv_transfer_group", lambda: connector)
+    worker, _ = _worker(monkeypatch)
+
+    worker.discard(("kv_cache",))
+    assert connector.unregister_kv_caches.call_count == 1
+    worker.sleep(2)
+    assert connector.unregister_kv_caches.call_count == 1
+    worker.wake_up(["weights"])
+    assert connector.restore_kv_caches.call_count == 0
+    worker.wake_up(["kv_cache"])
+    assert connector.restore_kv_caches.call_count == 1

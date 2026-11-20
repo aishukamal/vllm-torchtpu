@@ -110,6 +110,7 @@ class KVStorageRecord:
 @dataclass
 class SleepState:
     level: int
+    """The sleep level, or 0 while only ``discard`` has released the KV cache."""
     sleeping_tags: set[str]
     weights: list[WeightRecord]
     kv_cache: list[KVStorageRecord]
@@ -383,6 +384,7 @@ def record_kv_cache(
 
 
 def release_kv_cache(records: Sequence[KVStorageRecord]) -> None:
+    synchronize_device()
     for record in records:
         for view in record.views:
             _release_storage(view.tensor)

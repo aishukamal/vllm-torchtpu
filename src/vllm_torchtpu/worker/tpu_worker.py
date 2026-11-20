@@ -962,12 +962,12 @@ class TPUWorker(WorkerBase):
         ``enable_nccl_comm_suspend`` has no effect:
         there is no NCCL communicator to suspend. This is a pure memory
         operation: no runtime checkpoint, no weight-transfer state. Calling
-        it while already asleep is a no-op.
+        it while the weights are asleep is a no-op; a KV cache that
+        ``discard`` or a partial wake left released stays as recorded.
         """
-        if self._sleep_state is not None:
-            logger.warning(
-                "TPU worker is already sleeping at level %d.", self._sleep_state.level
-            )
+        state = self._sleep_state
+        if state is not None and "weights" in state.sleeping_tags:
+            logger.warning("TPU worker is already sleeping at level %d.", state.level)
             return
         assert level in (1, 2), f"sleep level must be 1 or 2, got {level}"
         if self.model_config.enable_nccl_comm_suspend:
@@ -977,9 +977,15 @@ class TPUWorker(WorkerBase):
             )
         free_bytes_before_sleep, _ = sleep_mode.device_memory_info(self.devices)
 
-        kv_cache = sleep_mode.record_kv_cache(
-            self._kv_cache_tensors(), self._layer_kv_cache_tensors()
+        kv_asleep = state is not None and "kv_cache" in state.sleeping_tags
+        kv_cache = (
+            state.kv_cache
+            if kv_asleep
+            else sleep_mode.record_kv_cache(
+                self._kv_cache_tensors(), self._layer_kv_cache_tensors()
+            )
         )
+        kv_released = [] if kv_asleep else kv_cache
         weights, preserved = sleep_mode.record_weights(
             self.model_runner.get_model(),
             level,
@@ -987,10 +993,10 @@ class TPUWorker(WorkerBase):
             draft_model=self.get_draft_model(),
             preserve_patterns=self.model_config.sleep_preserve_parameter_names,
         )
-        if has_kv_transfer_group():
+        if has_kv_transfer_group() and not kv_asleep:
             get_kv_transfer_group().unregister_kv_caches()
         sleep_mode.release_weights(weights)
-        sleep_mode.release_kv_cache(kv_cache)
+        sleep_mode.release_kv_cache(kv_released)
         sleep_mode.reclaim_device_memory()
         self._sleep_state = sleep_mode.SleepState(
             level=level,
@@ -1010,7 +1016,7 @@ class TPUWorker(WorkerBase):
             format_gib(used_bytes),
         )
         planned_bytes = sum(record.nbytes for record in weights) + sum(
-            record.nbytes for record in kv_cache
+            record.nbytes for record in kv_released
         )
         backed_up_bytes = sum(
             record.nbytes for record in weights if record.host is not None
@@ -1072,6 +1078,45 @@ class TPUWorker(WorkerBase):
             state.sleeping_tags.discard("kv_cache")
         if not state.sleeping_tags:
             self._sleep_state = None
+
+    def discard(self, tags: tuple[str, ...]) -> None:
+        """Drop the KV cache storage without a sleep.
+
+        Reached through collective_rpc("discard") from
+        EngineCore.release_kv_cache_memory: a paused engine frees its HBM for
+        a colocated trainer and gets it back with ``wake_up(["kv_cache"])``.
+        Only ``kv_cache`` can be discarded; vLLM asks for no other tag, and a
+        discarded weights pool would lose the buffers a level-2 sleep keeps.
+        A KV cache that is already released stays as recorded.
+        """
+        unsupported = set(tags) - {"kv_cache"}
+        if unsupported:
+            raise RuntimeError(
+                f"Selective discard of {sorted(unsupported)} is not supported on "
+                "TPU; only the KV cache can be discarded."
+            )
+        state = self._sleep_state
+        if state is not None and "kv_cache" in state.sleeping_tags:
+            logger.warning("TPU worker has already released its KV cache.")
+            return
+        kv_cache = sleep_mode.record_kv_cache(
+            self._kv_cache_tensors(), self._layer_kv_cache_tensors()
+        )
+        if has_kv_transfer_group():
+            get_kv_transfer_group().unregister_kv_caches()
+        sleep_mode.release_kv_cache(kv_cache)
+        sleep_mode.reclaim_device_memory()
+        if state is None:
+            state = self._sleep_state = sleep_mode.SleepState(
+                level=0, sleeping_tags=set(), weights=[], kv_cache=[], preserved=[]
+            )
+        state.kv_cache = kv_cache
+        state.sleeping_tags.add("kv_cache")
+        logger.info(
+            "Sleep mode discarded %s GiB for tags %s.",
+            format_gib(sum(record.nbytes for record in kv_cache)),
+            tags,
+        )
 
     def _kv_cache_tensors(self) -> list[torch.Tensor]:
         runner = self.model_runner
