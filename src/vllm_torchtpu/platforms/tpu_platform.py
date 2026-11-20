@@ -740,6 +740,13 @@ class TpuPlatform(Platform):
         free, total = torch.accelerator.get_memory_info(device)
         return float(total - free)
 
+    def is_sleep_mode_available(self) -> bool:
+        # ModelConfig refuses enable_sleep_mode on platforms that answer False,
+        # and vLLM's default answers True only for the CUDA, ROCm and XPU
+        # enums. TPUWorker.sleep/wake_up implement it by swapping tensor
+        # storage; no sleep-mode backend (cumem) is involved.
+        return True
+
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return False
